@@ -51,6 +51,7 @@ public:
 private:
     uint32_t width_ = 0, height_ = 0;
     unsigned outputMode_ = 0, generatedCount_ = 0;
+    bool inPlace_ = false;
     DXGI_FORMAT format_ = DXGI_FORMAT_UNKNOWN;
     ComputePass update_, compose_;
     ComPtr<ID3D12Resource> state_, scratch_;

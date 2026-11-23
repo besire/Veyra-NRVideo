@@ -15,15 +15,22 @@ constexpr UINT kUpdateStride = 3, kComposeStride = 4;
 }
 
 std::string HudLock::describe() const {
-    return std::format("HUD lock {}x{} mode={} generated={}", width_, height_, outputMode_, generatedCount_);
+    return std::format("HUD lock {}x{} mode={} generated={} inPlace={}", width_, height_, outputMode_, generatedCount_, inPlace_ ? 1 : 0);
 }
 
 bool HudLock::initialize(ID3D12Device* device, uint32_t width, uint32_t height, DXGI_FORMAT format, unsigned outputMode) {
     if (!device || !width || !height || format == DXGI_FORMAT_UNKNOWN) return false;
     width_ = width; height_ = height; format_ = format; outputMode_ = outputMode;
+    scratch_.Reset();
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT formatSupport{format_, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+    inPlace_ = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) &&
+               options.TypedUAVLoadAdditionalFormats != FALSE &&
+               SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &formatSupport, sizeof(formatSupport))) &&
+               (formatSupport.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
     state_ = makeTexture(device, width_, height_, kStateFormat, true);
-    scratch_ = makeTexture(device, width_, height_, format_, true);
-    if (!state_ || !scratch_) return false;
+    if (!inPlace_) scratch_ = makeTexture(device, width_, height_, format_, true);
+    if (!state_ || (!inPlace_ && !scratch_)) return false;
     std::vector<uint8_t> cs;
     if (!update_.loadShader("HudLockUpdate.dxil", cs) || !update_.create(device, cs, 2 * kUpdateStride, 2, 1, kConstants)) return false;
     if (!compose_.loadShader("HudLockCompose.dxil", cs) ||
@@ -37,6 +44,19 @@ void HudLock::createViews(ID3D12Device* device, DescriptorStager& stager, ID3D12
     real_[0] = real[0]; real_[1] = real[1];
     generatedCount_ = std::min<unsigned>(generatedCount, kMaxGenerated);
     for (unsigned i = 0; i < generatedCount_; ++i) generated_[i] = generated[i];
+    if (inPlace_) {
+        bool uavOk = true;
+        for (unsigned i = 0; i < generatedCount_; ++i) {
+            if (generated_[i] && (generated_[i]->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+                uavOk = false;
+                break;
+            }
+        }
+        if (!uavOk) {
+            inPlace_ = false;
+            if (!scratch_) scratch_ = makeTexture(device, width_, height_, format_, true);
+        }
+    }
     for (unsigned parity = 0; parity < 2; ++parity) {
         const UINT base = parity * kUpdateStride;
         stager.stageSrv(real_[parity], nullptr, update_.heap.Get(), base);
@@ -46,10 +66,10 @@ void HudLock::createViews(ID3D12Device* device, DescriptorStager& stager, ID3D12
     for (unsigned slot = 0; slot < generatedCount_; ++slot)
         for (unsigned held = 0; held < 2; ++held) {
             const UINT base = (slot * 2 + held) * kComposeStride;
-            stager.stageSrv(generated_[slot], nullptr, compose_.heap.Get(), base);
+            stager.stageSrv(inPlace_ ? real_[held] : generated_[slot], nullptr, compose_.heap.Get(), base);
             stager.stageSrv(real_[held], nullptr, compose_.heap.Get(), base + 1);
             stager.stageSrv(state_.Get(), nullptr, compose_.heap.Get(), base + 2);
-            makeUav(device, scratch_.Get(), format_, cpuHandleOf(compose_, base + 3));
+            makeUav(device, inPlace_ ? generated_[slot] : scratch_.Get(), format_, cpuHandleOf(compose_, base + 3));
         }
 }
 
@@ -72,16 +92,29 @@ bool HudLock::update(ID3D12GraphicsCommandList* list, StateTracker& tracker, uns
 }
 
 bool HudLock::compose(ID3D12GraphicsCommandList* list, StateTracker& tracker, unsigned slot, unsigned heldParity) {
-    if (!list || slot >= generatedCount_ || heldParity > 1 || !generated_[slot] || !real_[heldParity]) return false;
+    if (!list || slot >= generatedCount_ || heldParity > 1 || !generated_[slot] || !real_[heldParity] || (!inPlace_ && !scratch_)) return false;
     auto* generated = generated_[slot];
     float c[kConstants]{};
     c[0] = std::bit_cast<float>(width_); c[1] = std::bit_cast<float>(height_);
     c[2] = std::bit_cast<float>(uint32_t(outputMode_));
+    c[3] = std::bit_cast<float>(uint32_t(inPlace_ ? 1 : 0));
+    const UINT base = (slot * 2 + heldParity) * kComposeStride;
+    if (inPlace_) {
+        tracker.transition(list, generated, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        tracker.transition(list, real_[heldParity], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        tracker.transition(list, state_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        compose_.bind(list, c, gpuHandleOf(compose_, base).ptr, gpuHandleOf(compose_, base + 3).ptr);
+        list->Dispatch((width_ + 15) / 16, (height_ + 15) / 16, 1);
+        tracker.uavBarrier(list, generated);
+        tracker.transition(list, generated, D3D12_RESOURCE_STATE_COMMON);
+        tracker.transition(list, state_.Get(), D3D12_RESOURCE_STATE_COMMON);
+        tracker.transition(list, real_[heldParity], D3D12_RESOURCE_STATE_COMMON);
+        return true;
+    }
     tracker.transition(list, generated, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     tracker.transition(list, real_[heldParity], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     tracker.transition(list, state_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     tracker.transition(list, scratch_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    const UINT base = (slot * 2 + heldParity) * kComposeStride;
     compose_.bind(list, c, gpuHandleOf(compose_, base).ptr, gpuHandleOf(compose_, base + 3).ptr);
     list->Dispatch((width_ + 15) / 16, (height_ + 15) / 16, 1);
     tracker.uavBarrier(list, scratch_.Get());

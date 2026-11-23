@@ -2257,7 +2257,7 @@ bool EnhanceGraph::createComputePasses()
     if (!uploadPass_.loadShader("Nv12Upload.dxil", cs) || !uploadPass_.create(context_.device(), cs, 4, 1, 2)) return false;
     if (!densifyPass_.loadShader("NvofDensify.dxil", cs) ||
         !densifyPass_.create(context_.device(), cs, 7, 5, 2)) return false;
-    if(desc_.hdrWorking()&&videoSrInput_&&(!hdrVideoSrPass_.loadShader("HdrVideoSrRestore.dxil",cs)||!hdrVideoSrPass_.create(context_.device(),cs,10,3,1)))return false;
+    if(desc_.hdrWorking()&&videoSrInput_&&(!hdrVideoSrPass_.loadShader("HdrVideoSrRestore.dxil",cs)||!hdrVideoSrPass_.create(context_.device(),cs,12,3,1)))return false;
     // Three-step SR: NrDownsample's exact area shrink before RTX Video SR, SrResolve after it.
     if(srPrescaled_&&(!srPrescalePass_.loadShader("NrDownsample.dxil",cs)||!srPrescalePass_.create(context_.device(),cs,2,1,1)))return false;
     if(videoSrOutput_&&srResolveActive()&&(!srResolvePass_.loadShader("SrResolve.dxil",cs)||!srResolvePass_.create(context_.device(),cs,10,3,1)))return false;
@@ -2450,6 +2450,10 @@ bool EnhanceGraph::createViews()
             stagedSrv(srPrescaled_.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,hdrVideoSrPass_,7);
             stagedSrv(videoSrInput_.Get(),DXGI_FORMAT_R8G8B8A8_UNORM,hdrVideoSrPass_,8);
             stagedSrv(videoSrOutput_.Get(),DXGI_FORMAT_R8G8B8A8_UNORM,hdrVideoSrPass_,9);
+        }
+        if(hdr10Output()){
+            makeUav(context_.device(),videoFrame_[0].Get(),outputFormat(),cpu(hdrVideoSrPass_,10));
+            makeUav(context_.device(),videoFrame_[1].Get(),outputFormat(),cpu(hdrVideoSrPass_,11));
         }
     }
     // Three-step SR. Prescale: 0 resolved SR input, 1 shrunk input (UAV); ScaleBlit
@@ -3370,6 +3374,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         cpuTrace.mark("sourcePass");
     }
 
+    bool videoFrameWritten=false;
     // Video Effects hand-off: copy in, submit, queue signal -> CUDA run -> queue
     // wait, then copy out on the next list of this slot. No CPU wait.
     auto runVfx=[&](VfxSrBackend& vfx,ID3D12Resource* input,ID3D12Resource* output)->bool{
@@ -3435,21 +3440,40 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         tracker_.transition(list,videoSrInput_.Get(),D3D12_RESOURCE_STATE_COMMON);tracker_.transition(list,videoSrOutput_.Get(),D3D12_RESOURCE_STATE_COMMON);
         if(vfxSrBackend_){if(!runVfx(*vfxSrBackend_,videoSrInput_.Get(),videoSrOutput_.Get()))return false;}
         else if(!videoSrBackend_->evaluate(list,videoSrInput_.Get(),videoSrOutput_.Get(),desc_.dualSr?desc_.dualSrQuality:desc_.videoSrQuality)){failedBackend_=engine::FailedBackend::Sr;return false;}
-        tracker_.uavBarrier(list,videoSrOutput_.Get());tracker_.transition(list,videoSrOutput_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);tracker_.transition(list,workRgba_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        tracker_.uavBarrier(list,videoSrOutput_.Get());tracker_.transition(list,videoSrOutput_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         // HDR restore and the resolve take the base that was encoded.
         const UINT restoreSet=prescaled?7:desc_.nrBeforeSr||sourcePostOutput_?4:0;
-        if(srResolveActive()){
+        const bool directHdr10VideoSr=
+            desc_.hdrWorking()&&hdr10Output()&&!srResolveActive()&&
+            !retainReferences&&!nrEnabled_&&!nrHoldPass_&&
+            !videoHdrBackend_&&!preNrColorOutput_&&preNrPasses_.empty()&&
+            tailPasses_.empty()&&!tailColorOutput_&&!desc_.splitNrAcrossSr();
+        if(directHdr10VideoSr){
+            auto* hdrBase=prescaled?srPrescaled_.Get():(desc_.nrBeforeSr||sourcePostOutput_)?srStageInput():srcRgba_.Get();
+            tracker_.transition(list,hdrBase,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             tracker_.transition(list,videoSrInput_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            const float fit[8]={uintBits(srOutW_),uintBits(srOutH_),uintBits(workW_),uintBits(workH_),desc_.hdrWorking()?1.0f:0.0f,0,0,0};
-            srResolvePass_.bind(list,fit,gpuHandleOf(srResolvePass_,restoreSet).ptr,gpuHandleOf(srResolvePass_,3).ptr);
+            tracker_.transition(list,videoFrame_[parity].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            const float dec[8]={uintBits(workW_),uintBits(workH_),uintBits(workW_),uintBits(workH_),2.0f,outputDitherStep(),0,0};
+            hdrVideoSrPass_.bind(list,dec,gpuHandleOf(hdrVideoSrPass_,restoreSet).ptr,gpuHandleOf(hdrVideoSrPass_,10+parity).ptr);
+            list->Dispatch((workW_+15)/16,(workH_+15)/16,1);
+            tracker_.uavBarrier(list,videoFrame_[parity].Get());
+            tracker_.transition(list,videoFrame_[parity].Get(),D3D12_RESOURCE_STATE_COMMON);
+            videoFrameWritten=true;
         }else{
-            const float dec[8]={uintBits(workW_),uintBits(workH_),uintBits(workW_),uintBits(workH_),-1,0,0,0};
-            if(desc_.hdrWorking()){
+            tracker_.transition(list,workRgba_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if(srResolveActive()){
                 tracker_.transition(list,videoSrInput_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                hdrVideoSrPass_.bind(list,dec,gpuHandleOf(hdrVideoSrPass_,restoreSet).ptr,gpuHandleOf(hdrVideoSrPass_,3).ptr);
-            }else blitPass_.bind(list,dec,gpuHandleOf(blitPass_,17).ptr,gpuHandleOf(blitPass_,1).ptr);
+                const float fit[8]={uintBits(srOutW_),uintBits(srOutH_),uintBits(workW_),uintBits(workH_),desc_.hdrWorking()?1.0f:0.0f,0,0,0};
+                srResolvePass_.bind(list,fit,gpuHandleOf(srResolvePass_,restoreSet).ptr,gpuHandleOf(srResolvePass_,3).ptr);
+            }else{
+                const float dec[8]={uintBits(workW_),uintBits(workH_),uintBits(workW_),uintBits(workH_),-1,0,0,0};
+                if(desc_.hdrWorking()){
+                    tracker_.transition(list,videoSrInput_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    hdrVideoSrPass_.bind(list,dec,gpuHandleOf(hdrVideoSrPass_,restoreSet).ptr,gpuHandleOf(hdrVideoSrPass_,3).ptr);
+                }else blitPass_.bind(list,dec,gpuHandleOf(blitPass_,17).ptr,gpuHandleOf(blitPass_,1).ptr);
+            }
+            list->Dispatch((workW_+15)/16,(workH_+15)/16,1);tracker_.uavBarrier(list,workRgba_.Get());tracker_.transition(list,workRgba_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
-        list->Dispatch((workW_+15)/16,(workH_+15)/16,1);tracker_.uavBarrier(list,workRgba_.Get());tracker_.transition(list,workRgba_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         ++metrics_.srEvaluateCount;
         return true;
     };
@@ -4162,7 +4186,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         gpuTimer_.mark(list,GpuStage::VideoHdr,true);
     }
     // 5. Working frame -> SDR RGBA8 videoFrame[parity] + NVOF chain.
-    {
+    if(!videoFrameWritten){
         const UINT srcSlot = videoHdrBackend_?20:2;
         const UINT uavSlot = 3 + parity;
         tracker_.transition(list, tailColorOutput_?tailColorOutput_:(nrEnabled_ && nrCreated() && desc_.finalNrAfterSr()) ? residualRgba_.Get() : (preNrColorOutput_?preNrColorOutput_:workRgba_.Get()),
