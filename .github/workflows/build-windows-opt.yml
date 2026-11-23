@@ -1,0 +1,391 @@
+name: Windows x64 Release Build (RTX 5080 Opt)
+
+on:
+  push:
+    branches: ['opt/rtx5080-capture-hdr', 'main']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: win-opt-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-win64:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Qt 6.8.3 (msvc2022_64)
+        id: install-qt
+        uses: jurplel/install-qt-action@d325aaf2a8baeeda41ad0b5d39f84a6af9bcf005 # v4.3.0
+        with:
+          version: '6.8.3'
+          arch: 'win64_msvc2022_64'
+          cache: true
+          install-deps: false
+
+      - name: Fetch build-time public SDK headers and resolve toolchain deps
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          function Download-File([string]$Url, [string]$OutFile) {
+            Write-Host "Downloading $Url -> $OutFile"
+            & curl.exe -fSL --retry 3 --retry-delay 3 -o $OutFile $Url
+            if ($LASTEXITCODE -ne 0) {
+              throw "Download failed ($LASTEXITCODE): $Url"
+            }
+          }
+
+          function To-CmakePath([string]$PathValue) {
+            return ($PathValue -replace '\\', '/')
+          }
+
+          $deps = Join-Path $env:RUNNER_TEMP 'vd'
+          $buildDir = Join-Path $env:RUNNER_TEMP 'vb'
+          if (Test-Path -LiteralPath $deps) { Remove-Item -LiteralPath $deps -Recurse -Force }
+          if (Test-Path -LiteralPath $buildDir) { Remove-Item -LiteralPath $buildDir -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $deps, $buildDir | Out-Null
+
+          # 1. FFmpeg 9.0 LGPL shared dev (exact avcodec-63 / avformat-63 / avutil-61 ABI match to Veyra 2.2.0)
+          $ffZip = Join-Path $deps 'ffmpeg.zip'
+          $ffRaw = Join-Path $deps 'ffmpeg_raw'
+          Download-File 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip' $ffZip
+          Expand-Archive -LiteralPath $ffZip -DestinationPath $ffRaw -Force
+          Remove-Item -LiteralPath $ffZip -Force
+          $avformatH = Get-ChildItem -Path $ffRaw -Filter 'avformat.h' -Recurse -File |
+            Where-Object { $_.FullName -match 'libavformat[/\\]avformat\.h$' } |
+            Select-Object -First 1
+          if (-not $avformatH) { throw 'FFmpeg archive missing include/libavformat/avformat.h' }
+          $ffmpegRoot = Split-Path (Split-Path (Split-Path $avformatH.FullName -Parent) -Parent) -Parent
+          foreach ($rel in @('include\libavfilter\avfilter.h', 'lib\avcodec.lib', 'lib\avformat.lib', 'lib\avutil.lib', 'lib\swresample.lib', 'lib\swscale.lib', 'bin\avcodec-63.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $ffmpegRoot $rel) -PathType Leaf)) {
+              throw "FFmpeg layout missing $rel under $ffmpegRoot"
+            }
+          }
+          $findFfmpegDir = Join-Path $ffmpegRoot 'share\ffmpeg'
+          New-Item -ItemType Directory -Force -Path $findFfmpegDir | Out-Null
+          @'
+          set(FFMPEG_INCLUDE_DIRS "${VEYRA_FFMPEG_ROOT}/include")
+          set(FFMPEG_LIBRARY_DIRS "${VEYRA_FFMPEG_ROOT}/lib")
+          set(FFMPEG_LIBRARIES
+            "${VEYRA_FFMPEG_ROOT}/lib/avformat.lib"
+            "${VEYRA_FFMPEG_ROOT}/lib/avcodec.lib"
+            "${VEYRA_FFMPEG_ROOT}/lib/avutil.lib"
+            "${VEYRA_FFMPEG_ROOT}/lib/swresample.lib"
+            "${VEYRA_FFMPEG_ROOT}/lib/swscale.lib")
+          include(FindPackageHandleStandardArgs)
+          find_package_handle_standard_args(FFMPEG DEFAULT_MSG FFMPEG_INCLUDE_DIRS FFMPEG_LIBRARIES)
+          '@ | Set-Content -LiteralPath (Join-Path $findFfmpegDir 'FindFFMPEG.cmake') -Encoding UTF8
+
+          # 2. NVIDIA DLSS SDK v310.7.0
+          $dlssRoot = Join-Path $deps 'dlss'
+          & git clone --depth 1 --branch v310.7.0 https://github.com/NVIDIA/DLSS.git $dlssRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to clone NVIDIA/DLSS v310.7.0' }
+          foreach ($rel in @('include\nvsdk_ngx.h', 'lib\Windows_x86_64\x64\nvsdk_ngx_s.lib')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $dlssRoot $rel) -PathType Leaf)) {
+              throw "DLSS SDK missing $rel under $dlssRoot"
+            }
+          }
+
+          # 3. NVIDIA Optical Flow 5.0 MIT headers (D3D12 + Common)
+          $nvofRoot = Join-Path $deps 'nvof'
+          $nvofIface = Join-Path $nvofRoot 'NvOFInterface'
+          New-Item -ItemType Directory -Force -Path $nvofIface, (Join-Path $nvofRoot 'Common\NvOFBase') | Out-Null
+          Download-File 'https://raw.githubusercontent.com/jp7677/dxvk-nvapi/master/inc/nvofapi/nvOpticalFlowCommon.h' (Join-Path $nvofIface 'nvOpticalFlowCommon.h')
+          Download-File 'https://raw.githubusercontent.com/jp7677/dxvk-nvapi/master/inc/nvofapi/nvOpticalFlowD3D12.h' (Join-Path $nvofIface 'nvOpticalFlowD3D12.h')
+
+          # 4. NVENC 13.0 headers (n13.0.19.0)
+          $nvencRoot = Join-Path $deps 'nvenc'
+          & git clone --depth 1 --branch n13.0.19.0 https://github.com/FFmpeg/nv-codec-headers.git $nvencRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to clone nv-codec-headers n13.0.19.0' }
+          if (-not (Test-Path -LiteralPath (Join-Path $nvencRoot 'include\ffnvcodec\nvEncodeAPI.h') -PathType Leaf)) {
+            throw "nv-codec-headers missing nvEncodeAPI.h under $nvencRoot"
+          }
+
+          # 5. CUDA 12.8.90 driver/runtime headers (enables VFG + RTX Video SR v2)
+          $cudaZip = Join-Path $deps 'cuda.zip'
+          $cudaRaw = Join-Path $deps 'cuda_raw'
+          Download-File 'https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.8.90-archive.zip' $cudaZip
+          Expand-Archive -LiteralPath $cudaZip -DestinationPath $cudaRaw -Force
+          Remove-Item -LiteralPath $cudaZip -Force
+          $cudaH = Get-ChildItem -Path $cudaRaw -Filter 'cuda.h' -Recurse -File | Select-Object -First 1
+          if (-not $cudaH) { throw 'CUDA cudart archive missing cuda.h' }
+          $cudaIncDir = $cudaH.DirectoryName
+
+          # 6. Intel XeSS SDK 3.0.2 (header-only, enables VEYRA_HAS_XESS=1)
+          $xessZip = Join-Path $deps 'xess.zip'
+          $xessRaw = Join-Path $deps 'xess_raw'
+          Download-File 'https://github.com/intel/xess/releases/download/v3.0.2/XeSS_SDK_3.0.2.zip' $xessZip
+          Expand-Archive -LiteralPath $xessZip -DestinationPath $xessRaw -Force
+          Remove-Item -LiteralPath $xessZip -Force
+          $xessH = Get-ChildItem -Path $xessRaw -Filter 'xefg_swapchain_d3d12.h' -Recurse -File | Select-Object -First 1
+          if (-not $xessH) { throw 'XeSS SDK missing inc/xess_fg/xefg_swapchain_d3d12.h' }
+          $xessRoot = Split-Path (Split-Path $xessH.DirectoryName -Parent) -Parent
+
+          # 7. AMD FidelityFX SDK 2.3.0 headers (sparse checkout of pinned commit, enables VEYRA_HAS_FSR=1)
+          $ffxRepo = Join-Path $deps 'ffx2'
+          New-Item -ItemType Directory -Force -Path $ffxRepo | Out-Null
+          Push-Location $ffxRepo
+          try {
+            & git init -q
+            & git config core.sparseCheckout true
+            'Kits/FidelityFX' | Set-Content -LiteralPath '.git\info\sparse-checkout' -Encoding ASCII
+            & git fetch --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git 60f4ea81909200d8542eca14dccb2628b763a9a3
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch FidelityFX-SDK 2.3.0 headers' }
+            & git checkout -q FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to checkout FidelityFX-SDK FETCH_HEAD' }
+          } finally {
+            Pop-Location
+          }
+          $ffx2Root = Join-Path $ffxRepo 'Kits\FidelityFX'
+          if (-not (Test-Path -LiteralPath (Join-Path $ffx2Root 'framegeneration\include\dx12\ffx_api_framegeneration_dx12.h') -PathType Leaf)) {
+            throw "FidelityFX 2.3.0 missing ffx_api_framegeneration_dx12.h under $ffx2Root"
+          }
+
+          # 8. Locate Qt 6.8.3 root
+          $qtRoot = $env:QT_ROOT_DIR
+          if ([string]::IsNullOrWhiteSpace($qtRoot)) { $qtRoot = '${{ steps.install-qt.outputs.qt-root-dir }}' }
+          if (-not (Test-Path -LiteralPath (Join-Path $qtRoot 'lib\cmake\Qt6\Qt6Config.cmake') -PathType Leaf)) {
+            throw "Qt6Config.cmake not found under QT_ROOT_DIR='$qtRoot'"
+          }
+
+          # 9. Locate OpenSSL (prefer Shining Light static MT; fallback to dynamic import lib)
+          $osslCandidates = @($env:OPENSSL_ROOT_DIR, 'C:\Program Files\OpenSSL', 'C:\Program Files\OpenSSL-Win64', 'C:\vcpkg\installed\x64-windows') |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath (Join-Path $_ 'include\openssl\evp.h') -PathType Leaf) }
+          $osslRoot = $osslCandidates | Select-Object -First 1
+          if (-not $osslRoot) { throw 'OpenSSL installation with include/openssl/evp.h not found on runner' }
+
+          Write-Host "Discovered OpenSSL root: $osslRoot"
+          $allCryptoLibs = Get-ChildItem -Path (Join-Path $osslRoot 'lib') -Filter '*crypto*.lib' -Recurse -File
+          foreach ($item in $allCryptoLibs) { Write-Host "  OpenSSL lib candidate: $($item.FullName)" }
+
+          $staticMt = $allCryptoLibs |
+            Where-Object { $_.FullName -match '[/\\]MT[/\\]' -and $_.Name -match '^(libcrypto_static|libcrypto64MT)\.lib$' } |
+            Select-Object -First 1
+          if ($staticMt) {
+            $osslStatic = 'TRUE'
+            $osslLib = $staticMt.FullName
+          } else {
+            $dynLib = ($allCryptoLibs | Where-Object { $_.FullName -match '[/\\]x64[/\\](MT|MD)[/\\]libcrypto\.lib$' } | Select-Object -First 1)
+            if (-not $dynLib) { $dynLib = ($allCryptoLibs | Where-Object { $_.Name -eq 'libcrypto.lib' } | Select-Object -First 1) }
+            if (-not $dynLib) { throw "No usable libcrypto*.lib found under $osslRoot\lib" }
+            $osslStatic = 'FALSE'
+            $osslLib = $dynLib.FullName
+          }
+          $osslBinWin = ''
+          if (Test-Path -LiteralPath (Join-Path $osslRoot 'bin') -PathType Container) {
+            $osslBinWin = (Join-Path $osslRoot 'bin')
+          }
+
+          # 10. Resolve Visual Studio 2022 C++ installation path cleanly without cmd for/f quoting hazards
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) { throw "vswhere.exe not found at $vswhere" }
+          $vsRoot = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) | Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($vsRoot)) { throw 'Visual Studio 2022 C++ tools not found' }
+
+          $envMap = [ordered]@{
+            CI_VEYRA_VSROOT          = $vsRoot
+            CI_VEYRA_DLSS_ROOT       = To-CmakePath $dlssRoot
+            CI_VEYRA_NVOF_ROOT       = To-CmakePath $nvofRoot
+            CI_VEYRA_NVENC_ROOT      = To-CmakePath $nvencRoot
+            CI_VEYRA_CUDA_INC        = To-CmakePath $cudaIncDir
+            CI_VEYRA_FFMPEG_ROOT     = To-CmakePath $ffmpegRoot
+            CI_VEYRA_XESS_ROOT       = To-CmakePath $xessRoot
+            CI_VEYRA_FFX2_ROOT       = To-CmakePath $ffx2Root
+            CI_VEYRA_QT_ROOT         = To-CmakePath $qtRoot
+            CI_VEYRA_OSSL_ROOT       = To-CmakePath $osslRoot
+            CI_VEYRA_OSSL_INC        = To-CmakePath (Join-Path $osslRoot 'include')
+            CI_VEYRA_OSSL_LIB        = To-CmakePath $osslLib
+            CI_VEYRA_OSSL_STATIC     = $osslStatic
+            CI_VEYRA_OSSL_BIN_WIN    = $osslBinWin
+            CI_VEYRA_FFMPEG_BIN_WIN  = (Join-Path $ffmpegRoot 'bin')
+            CI_VEYRA_QT_BIN_WIN      = (Join-Path $qtRoot 'bin')
+            CI_VEYRA_BUILD_DIR_WIN   = $buildDir
+            CI_VEYRA_BUILD_DIR_CMAKE = To-CmakePath $buildDir
+          }
+          foreach ($kv in $envMap.GetEnumerator()) {
+            Write-Host "$($kv.Key)=$($kv.Value)"
+            "$($kv.Key)=$($kv.Value)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Configure and build veyra_qml_ui and tests (MSVC 2022 Release x64)
+        shell: cmd
+        run: |
+          @echo off
+          set "VSLANG=1033"
+          call "%CI_VEYRA_VSROOT%\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 4
+          chcp 65001 >nul
+
+          cmake --preset x64-release ^
+            -B "%CI_VEYRA_BUILD_DIR_CMAKE%" ^
+            -DVEYRA_DISPLAY_VERSION=2.2.0-rtx5080-opt ^
+            -DVEYRA_BUILD_QML_UI=ON ^
+            -DVEYRA_ENABLE_EXPERIMENTAL_DLSSNR=ON ^
+            -DVEYRA_ENABLE_LIBDOVI=OFF ^
+            -DVEYRA_ENABLE_D3D12_DEBUG=OFF ^
+            -DVEYRA_DLSS_SDK_ROOT="%CI_VEYRA_DLSS_ROOT%" ^
+            -DVEYRA_NVOF_SDK_ROOT="%CI_VEYRA_NVOF_ROOT%" ^
+            -DVEYRA_NVENC_HEADERS_ROOT="%CI_VEYRA_NVENC_ROOT%" ^
+            -DVEYRA_CUDA_DRIVER_INCLUDE_DIR="%CI_VEYRA_CUDA_INC%" ^
+            -DVEYRA_FFMPEG_ROOT="%CI_VEYRA_FFMPEG_ROOT%" ^
+            -DVEYRA_XESS_ROOT="%CI_VEYRA_XESS_ROOT%" ^
+            -DVEYRA_FIDELITYFX2_ROOT="%CI_VEYRA_FFX2_ROOT%" ^
+            -DOPENSSL_ROOT_DIR="%CI_VEYRA_OSSL_ROOT%" ^
+            -DOPENSSL_INCLUDE_DIR="%CI_VEYRA_OSSL_INC%" ^
+            -DOPENSSL_CRYPTO_LIBRARY="%CI_VEYRA_OSSL_LIB%" ^
+            -DOPENSSL_USE_STATIC_LIBS=%CI_VEYRA_OSSL_STATIC% ^
+            -DOPENSSL_MSVC_STATIC_RT=%CI_VEYRA_OSSL_STATIC% ^
+            -DCMAKE_PREFIX_PATH="%CI_VEYRA_QT_ROOT%"
+          if errorlevel 1 exit /b 5
+
+          findstr /C:"VEYRA_HAVE_CUDA_DRIVER_HEADERS=1" "%CI_VEYRA_BUILD_DIR_WIN%\build.ninja" >nul
+          if errorlevel 1 (
+            echo ERROR: VEYRA_HAVE_CUDA_DRIVER_HEADERS=1 not active in build.ninja
+            exit /b 5
+          )
+
+          cmake --build "%CI_VEYRA_BUILD_DIR_CMAKE%" --parallel 4 --target ^
+            veyra_qml_ui ^
+            veyra_live_timing_tests ^
+            veyra_hud_lock_gpu_tests ^
+            veyra_sr_quality_tests ^
+            veyra_hdr_enhancement_tests
+          if errorlevel 1 exit /b 6
+
+      - name: Run CPU and WARP D3D12 verification + inspect DLL dependents
+        shell: cmd
+        run: |
+          @echo off
+          call "%CI_VEYRA_VSROOT%\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 4
+
+          set "PATH=%CI_VEYRA_FFMPEG_BIN_WIN%;%CI_VEYRA_QT_BIN_WIN%;%CI_VEYRA_OSSL_BIN_WIN%;%PATH%"
+          echo === Running veyra_live_timing_tests.exe (AVX2 + dedup) ===
+          "%CI_VEYRA_BUILD_DIR_WIN%\veyra_live_timing_tests.exe"
+          if errorlevel 1 exit /b 11
+
+          echo === Running veyra_hud_lock_gpu_tests.exe (D3D12 WARP) ===
+          "%CI_VEYRA_BUILD_DIR_WIN%\veyra_hud_lock_gpu_tests.exe"
+          if errorlevel 1 exit /b 12
+
+          echo === Inspecting veyra_qml_ui.exe dependents ===
+          dumpbin /dependents "%CI_VEYRA_BUILD_DIR_WIN%\veyra_qml_ui.exe"
+          if errorlevel 1 exit /b 13
+
+      - name: Stage overlay package for portable Veyra 2.2.0
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $buildDir = $env:CI_VEYRA_BUILD_DIR_WIN
+          $overlay = Join-Path $env:RUNNER_TEMP 'artifact\veyra-2.2.0-rtx5080-opt-overlay'
+          if (Test-Path -LiteralPath $overlay) { Remove-Item -LiteralPath $overlay -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $overlay, (Join-Path $overlay 'shaders'), (Join-Path $overlay 'tests') | Out-Null
+
+          $exePath = Join-Path $buildDir 'veyra_qml_ui.exe'
+          if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) { throw 'Built veyra_qml_ui.exe missing' }
+          Copy-Item -LiteralPath $exePath -Destination (Join-Path $overlay 'veyra_qml_ui.exe') -Force
+
+          $shaderSrc = Join-Path $buildDir 'shaders'
+          Copy-Item -Path (Join-Path $shaderSrc '*') -Destination (Join-Path $overlay 'shaders') -Recurse -Force
+          foreach ($mustHave in @('HdrVideoSrRestore.dxil', 'SrResolve.dxil', 'HudLockCompose.dxil', 'HudLockUpdate.dxil')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $overlay "shaders\$mustHave") -PathType Leaf)) {
+              throw "Required compiled shader missing: $mustHave"
+            }
+          }
+
+          foreach ($t in @('veyra_live_timing_tests.exe', 'veyra_hud_lock_gpu_tests.exe', 'veyra_sr_quality_tests.exe', 'veyra_hdr_enhancement_tests.exe')) {
+            $tPath = Join-Path $buildDir $t
+            if (-not (Test-Path -LiteralPath $tPath -PathType Leaf)) { throw "Built test executable missing: $t" }
+            Copy-Item -LiteralPath $tPath -Destination (Join-Path $overlay "tests\$t") -Force
+          }
+
+          # Detect imported DLLs via dumpbin and include any dynamic OpenSSL runtime DLL if needed.
+          $dumpbin = Get-ChildItem -Path (Join-Path $env:CI_VEYRA_VSROOT 'VC\Tools\MSVC') -Filter 'dumpbin.exe' -Recurse -File |
+            Where-Object { $_.FullName -match 'Hostx64[/\\]x64[/\\]dumpbin\.exe$' } |
+            Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe not found' }
+          $depsText = & $dumpbin.FullName /nologo /dependents $exePath
+          $depsText | Out-File -LiteralPath (Join-Path $overlay 'dependents.txt') -Encoding utf8
+
+          foreach ($line in $depsText) {
+            if ($line -match '^\s*(libcrypto[^\s]*\.dll)\s*$') {
+              $dllName = $Matches[1]
+              if ($env:CI_VEYRA_OSSL_BIN_WIN -and (Test-Path -LiteralPath (Join-Path $env:CI_VEYRA_OSSL_BIN_WIN $dllName) -PathType Leaf)) {
+                Copy-Item -LiteralPath (Join-Path $env:CI_VEYRA_OSSL_BIN_WIN $dllName) -Destination (Join-Path $overlay $dllName) -Force
+                Write-Host "Included OpenSSL runtime DLL: $dllName"
+              } else {
+                throw "veyra_qml_ui.exe depends on $dllName, but it was not found under '$($env:CI_VEYRA_OSSL_BIN_WIN)'"
+              }
+            }
+          }
+
+          $applyScript = @'
+          [CmdletBinding()]
+          param(
+              [Parameter(Mandatory = $true)][string]$AppDir
+          )
+          $ErrorActionPreference = 'Stop'
+          $resolved = (Resolve-Path -LiteralPath $AppDir).Path
+          if (-not (Test-Path -LiteralPath (Join-Path $resolved 'veyra_qml_ui.exe') -PathType Leaf) -or
+              -not (Test-Path -LiteralPath (Join-Path $resolved 'shaders') -PathType Container)) {
+              throw "Target '$resolved' does not look like Veyra's versions\2.2.0 directory (missing veyra_qml_ui.exe or shaders/)."
+          }
+          $here = $PSScriptRoot
+          Copy-Item -LiteralPath (Join-Path $here 'veyra_qml_ui.exe') -Destination (Join-Path $resolved 'veyra_qml_ui.exe') -Force
+          Copy-Item -Path (Join-Path $here 'shaders\*') -Destination (Join-Path $resolved 'shaders') -Recurse -Force
+          Get-ChildItem -LiteralPath $here -Filter '*.dll' -File | ForEach-Object {
+              Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $resolved $_.Name) -Force
+          }
+          Write-Host "Applied optimized veyra_qml_ui.exe and shaders into $resolved"
+          '@
+          $applyScript | Set-Content -LiteralPath (Join-Path $overlay 'apply-to-portable.ps1') -Encoding UTF8
+
+          $readme = @'
+          Veyra 2.2.0 (RTX 5080 + Capture Card HDR/FG Optimizations) - Overlay Package
+          ===========================================================================
+
+          How to use (do NOT overwrite your daily-use copy before testing):
+          1. Download the official "Veyra-2.2.0-NVIDIA-win64-portable.zip" from upstream releases and extract it to a NEW folder, e.g. D:\Veyra-Opt-Test\
+          2. Locate the inner version folder containing "veyra_qml_ui.exe" and "shaders\" (typically D:\Veyra-Opt-Test\versions\2.2.0\).
+          3. Either run in PowerShell:
+               .\apply-to-portable.ps1 -AppDir "D:\Veyra-Opt-Test\versions\2.2.0"
+             OR manually copy:
+               - veyra_qml_ui.exe -> replace versions\2.2.0\veyra_qml_ui.exe
+               - shaders\*        -> replace/merge into versions\2.2.0\shaders\
+               - any *.dll beside veyra_qml_ui.exe (only present if OpenSSL was dynamically linked)
+          4. Launch with an isolated data folder so existing settings stay untouched:
+               D:\Veyra-Opt-Test\versions\2.2.0\veyra_qml_ui.exe --data-dir D:\Veyra-Opt-Test\test-data
+
+          Notes:
+          - Local builds omit Veyra's release Ed25519 auto-update public key and libdovi (Dolby Vision RPU); capture-card HDR10 / PS5 GTA 6 pipelines are unaffected.
+          - To run the standalone RTX 5080 verification binaries under tests\, copy the desired test .exe into versions\2.2.0\ beside veyra_qml_ui.exe and shaders\ before running.
+          '@
+          $readme | Set-Content -LiteralPath (Join-Path $overlay 'README-INSTALL.txt') -Encoding UTF8
+
+          $sums = Get-ChildItem -Path $overlay -Recurse -File |
+            Sort-Object FullName |
+            ForEach-Object {
+              $h = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              $rel = $_.FullName.Substring($overlay.Length + 1) -replace '\\', '/'
+              "$h  $rel"
+            }
+          $sums | Set-Content -LiteralPath (Join-Path $overlay 'SHA256SUMS.txt') -Encoding UTF8
+          Write-Host "Staged $($sums.Count) files into $overlay"
+
+      - name: Upload Windows x64 overlay artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: veyra-2.2.0-rtx5080-opt-win64
+          path: ${{ runner.temp }}/artifact/veyra-2.2.0-rtx5080-opt-overlay
+          if-no-files-found: error
+          retention-days: 30
