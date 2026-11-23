@@ -6,9 +6,14 @@
 #include <Windows.h>
 #include <wrl/client.h>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <format>
+#include <mutex>
+#include <thread>
 #include <vector>
 #ifdef VEYRA_HAVE_CUDA_DRIVER_HEADERS
 #include <cuda.h>
@@ -66,7 +71,7 @@ struct VfxSrBackend::Impl {
 #define CU_FN(name) decltype(&name) name##Fn=nullptr
     CU_FN(cuInit);CU_FN(cuDeviceGetCount);CU_FN(cuDeviceGet);CU_FN(cuDeviceGetLuid);CU_FN(cuDeviceGetAttribute);
     CU_FN(cuDevicePrimaryCtxRetain);CU_FN(cuDevicePrimaryCtxRelease);CU_FN(cuCtxPushCurrent);CU_FN(cuCtxPopCurrent);
-    CU_FN(cuStreamCreate);CU_FN(cuStreamDestroy);CU_FN(cuStreamSynchronize);
+    CU_FN(cuStreamCreate);CU_FN(cuStreamDestroy);CU_FN(cuStreamSynchronize);CU_FN(cuStreamQuery);
     CU_FN(cuImportExternalMemory);CU_FN(cuExternalMemoryGetMappedBuffer);CU_FN(cuDestroyExternalMemory);CU_FN(cuMemFree);
     CU_FN(cuImportExternalSemaphore);CU_FN(cuDestroyExternalSemaphore);CU_FN(cuWaitExternalSemaphoresAsync);CU_FN(cuSignalExternalSemaphoresAsync);
     CU_FN(cuGetErrorName);CU_FN(cuGetErrorString);
@@ -85,8 +90,16 @@ struct VfxSrBackend::Impl {
     CUexternalSemaphore inputSemaphore=nullptr,outputSemaphore=nullptr;
     CUcontext cudaContext=nullptr;CUstream stream=nullptr;CUdevice device=0;
     void* effect=nullptr;
-    bool retained=false,ready=false;
-    uint64_t signalValue=0;
+    static constexpr unsigned kMaxPending=4;
+    bool retained=false,ready=false,asynchronous=true;
+    uint64_t signalValue=0,queuedFence=0;
+    std::mutex jobsMutex,cudaSubmissionMutex;
+    std::condition_variable jobsChanged;
+    std::deque<uint64_t> jobs;
+    std::thread worker;
+    bool stopping=false;
+    std::atomic<bool> failed{false};
+    unsigned outstanding=0;
     std::vector<HMODULE> libraries;
     bool cv(int code,const char* name){
         if(code==0)return true;
@@ -142,11 +155,82 @@ struct VfxSrBackend::Impl {
         buffer.resource.Reset();
     }
     bool copy(ID3D12GraphicsCommandList* list,ID3D12Resource* texture,const Buffer& buffer,bool toBuffer){
-        if(!ready||!list||!texture)return false;
+        if(!ready||failed.load()||!list||!texture)return false;
         D3D12_TEXTURE_COPY_LOCATION shared{};shared.pResource=buffer.resource.Get();shared.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;shared.PlacedFootprint=buffer.footprint;
         D3D12_TEXTURE_COPY_LOCATION image{};image.pResource=texture;image.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;image.SubresourceIndex=0;
         if(toBuffer)list->CopyTextureRegion(&shared,0,0,0,&image,nullptr);else list->CopyTextureRegion(&image,0,0,0,&shared,nullptr);
         return true;
+    }
+    bool cudaJob(uint64_t value){
+        std::lock_guard submit(cudaSubmissionMutex);
+        if(failed.load())return false;
+        Current current(*this);
+        if(!current.active)return false;
+        CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS wait{};wait.params.fence.value=value;
+        const bool waited=cu(cuWaitExternalSemaphoresAsyncFn(&inputSemaphore,&wait,1,stream),"cuWaitExternalSemaphoresAsync");
+        bool ok=waited&&cv(runEffect(effect,1),"NvVFX_Run(VideoSuperRes)");
+        // Publish rejection before releasing the consumer so future submissions stop accepting work.
+        if(!ok)failed.store(true);
+        CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS signal{};signal.params.fence.value=value;
+        if(!waited||!cu(cuSignalExternalSemaphoresAsyncFn(&outputSemaphore,&signal,1,stream),"cuSignalExternalSemaphoresAsync")){
+            failed.store(true);
+            // A rejected or unsignaled job must never leave the graph queue waiting.
+            if(waited)cu(cuStreamSynchronizeFn(stream),"rejected VideoSuperRes drain");
+            hr(completion->Signal(value),"release failed VideoSuperRes job");
+            return false;
+        }
+        return ok;
+    }
+    void checkCudaCompletion(){
+        std::lock_guard submit(cudaSubmissionMutex);
+        Current current(*this);
+        const auto result=current.active?cuStreamQueryFn(stream):CUDA_ERROR_INVALID_CONTEXT;
+        if(result==CUDA_SUCCESS||result==CUDA_ERROR_NOT_READY)return;
+        cu(result,"asynchronous VideoSuperRes completion");
+        std::lock_guard lock(jobsMutex);
+        failed.store(true);
+        if(queuedFence&&completion->GetCompletedValue()<queuedFence)
+            hr(completion->Signal(queuedFence),"release VideoSuperRes waits after CUDA fault");
+    }
+    void work(){
+        for(;;){
+            uint64_t value=0;
+            {
+                std::unique_lock lock(jobsMutex);
+                if(jobs.empty()&&!stopping){
+                    if(!failed.load()&&queuedFence&&completion->GetCompletedValue()<queuedFence){
+                        jobsChanged.wait_for(lock,std::chrono::milliseconds(4),[&]{return stopping||!jobs.empty();});
+                    }else{
+                        jobsChanged.wait(lock,[&]{return stopping||!jobs.empty()||
+                            (!failed.load()&&queuedFence&&completion->GetCompletedValue()<queuedFence);});
+                    }
+                }
+                if(jobs.empty()){
+                    if(stopping)return;
+                    const bool pending=!failed.load()&&queuedFence&&completion->GetCompletedValue()<queuedFence;
+                    lock.unlock();
+                    if(pending)checkCudaCompletion();
+                    continue;
+                }
+                value=jobs.front();jobs.pop_front();
+            }
+            bool ok=false;
+            try{ok=cudaJob(value);}catch(...){log::error("vfx-sr","SDK worker exception; disabling VideoSuperRes");}
+            if(!ok){
+                failed.store(true);
+                std::lock_guard submit(cudaSubmissionMutex);
+                Current current(*this);
+                if(current.active&&stream)cu(cuStreamSynchronizeFn(stream),"rejected VideoSuperRes drain");
+                if(completion->GetCompletedValue()<value)
+                    hr(completion->Signal(value),"release failed VideoSuperRes job");
+            }
+            {std::lock_guard lock(jobsMutex);--outstanding;}
+        }
+    }
+    void stopWorker(){
+        {std::lock_guard lock(jobsMutex);stopping=true;}
+        jobsChanged.notify_one();
+        if(worker.joinable())worker.join();
     }
 #endif
 };
@@ -170,7 +254,7 @@ bool VfxSrBackend::initialize(gfx::D3D12DeviceContext& context,const std::wstrin
     BIND_CU(cuInit,"cuInit");BIND_CU(cuDeviceGetCount,"cuDeviceGetCount");BIND_CU(cuDeviceGet,"cuDeviceGet");BIND_CU(cuDeviceGetLuid,"cuDeviceGetLuid");
     BIND_CU(cuDeviceGetAttribute,"cuDeviceGetAttribute");BIND_CU(cuDevicePrimaryCtxRetain,"cuDevicePrimaryCtxRetain");
     BIND_CU(cuDevicePrimaryCtxRelease,"cuDevicePrimaryCtxRelease_v2");BIND_CU(cuCtxPushCurrent,"cuCtxPushCurrent_v2");BIND_CU(cuCtxPopCurrent,"cuCtxPopCurrent_v2");
-    BIND_CU(cuStreamCreate,"cuStreamCreate");BIND_CU(cuStreamDestroy,"cuStreamDestroy_v2");BIND_CU(cuStreamSynchronize,"cuStreamSynchronize");
+    BIND_CU(cuStreamCreate,"cuStreamCreate");BIND_CU(cuStreamDestroy,"cuStreamDestroy_v2");BIND_CU(cuStreamSynchronize,"cuStreamSynchronize");BIND_CU(cuStreamQuery,"cuStreamQuery");
     BIND_CU(cuImportExternalMemory,"cuImportExternalMemory");BIND_CU(cuExternalMemoryGetMappedBuffer,"cuExternalMemoryGetMappedBuffer");
     BIND_CU(cuDestroyExternalMemory,"cuDestroyExternalMemory");BIND_CU(cuMemFree,"cuMemFree_v2");
     BIND_CU(cuImportExternalSemaphore,"cuImportExternalSemaphore");BIND_CU(cuDestroyExternalSemaphore,"cuDestroyExternalSemaphore");
@@ -226,9 +310,11 @@ bool VfxSrBackend::initialize(gfx::D3D12DeviceContext& context,const std::wstrin
        !p.cv(p.setImage(p.effect,"SrcImage0",p.input.image),"SrcImage0")||!p.cv(p.setImage(p.effect,"DstImage0",p.output.image),"DstImage0")||
        !p.cv(p.setStream(p.effect,"CudaStream",p.stream),"CudaStream")||!p.cv(p.setU32(p.effect,"QualityLevel",quality),"QualityLevel")||
        !p.cv(p.loadEffect(p.effect),"NvVFX_Load(VideoSuperRes)"))return false;
+    p.asynchronous=GetEnvironmentVariableW(L"VEYRA_TEST_VFX_SR_SYNC",nullptr,0)==0;
     p.ready=true;
-    log::info("vfx-sr",std::format("VideoSuperRes quality={} input={}x{} output={}x{} compute={}.{} LUID={} loadMs={:.0f}",
-        quality,inputWidth,inputHeight,outputWidth,outputHeight,major,minor,context.adapter().luidString,
+    if(p.asynchronous)p.worker=std::thread([&p]{p.work();});
+    log::info("vfx-sr",std::format("VideoSuperRes quality={} input={}x{} output={}x{} async={} compute={}.{} LUID={} loadMs={:.0f}",
+        quality,inputWidth,inputHeight,outputWidth,outputHeight,p.asynchronous?1:0,major,minor,context.adapter().luidString,
         std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()));
     return true;
 #else
@@ -239,7 +325,7 @@ bool VfxSrBackend::initialize(gfx::D3D12DeviceContext& context,const std::wstrin
 
 bool VfxSrBackend::created()const{
 #ifdef VEYRA_HAVE_CUDA_DRIVER_HEADERS
-    return impl_->ready;
+    return impl_->ready&&!impl_->failed.load();
 #else
     return false;
 #endif
@@ -264,26 +350,46 @@ bool VfxSrBackend::copyOut(ID3D12GraphicsCommandList* list,ID3D12Resource* textu
 bool VfxSrBackend::run(ID3D12CommandQueue* queue){
 #ifdef VEYRA_HAVE_CUDA_DRIVER_HEADERS
     auto& p=*impl_;
-    if(!p.ready||!queue)return false;
+    if(!p.ready||p.failed.load()||!queue)return false;
+    if(!p.asynchronous){
+        const uint64_t value=++p.signalValue;
+        if(!hr(queue->Signal(p.producer.Get(),value),"signal VideoSuperRes producer"))return false;
+        const bool ok=p.cudaJob(value);
+        if(!ok){
+            p.failed.store(true);
+            std::lock_guard submit(p.cudaSubmissionMutex);
+            Impl::Current current(p);
+            if(current.active&&p.stream)p.cu(p.cuStreamSynchronizeFn(p.stream),"rejected VideoSuperRes drain");
+            if(p.completion->GetCompletedValue()<value)
+                hr(p.completion->Signal(value),"release failed VideoSuperRes job");
+        }
+        {
+            std::lock_guard lock(p.jobsMutex);
+            if(!hr(queue->Wait(p.completion.Get(),value),"queue wait VideoSuperRes completion"))return false;
+            p.queuedFence=value;
+            if(p.failed.load()&&p.completion->GetCompletedValue()<value)
+                hr(p.completion->Signal(value),"release VideoSuperRes wait after CUDA fault");
+        }
+        if(!ok)p.ready=false;
+        return ok;
+    }
+    std::lock_guard lock(p.jobsMutex);
+    if(p.stopping||p.failed.load()||p.outstanding>=Impl::kMaxPending){
+        log::error("vfx-sr","bounded VideoSuperRes submission rejected; no GPU wait queued");
+        p.ready=false;
+        return false;
+    }
     const uint64_t value=++p.signalValue;
     if(!hr(queue->Signal(p.producer.Get(),value),"signal VideoSuperRes producer"))return false;
-    bool waited=false,ok=false;
-    {
-        Impl::Current current(p);
-        if(current.active){
-            CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS wait{};wait.params.fence.value=value;
-            waited=p.cu(p.cuWaitExternalSemaphoresAsyncFn(&p.inputSemaphore,&wait,1,p.stream),"cuWaitExternalSemaphoresAsync");
-            ok=waited&&p.cv(p.runEffect(p.effect,1),"NvVFX_Run(VideoSuperRes)");
-            CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS signal{};signal.params.fence.value=value;
-            ok=p.cu(p.cuSignalExternalSemaphoresAsyncFn(&p.outputSemaphore,&signal,1,p.stream),"cuSignalExternalSemaphoresAsync")&&ok;
-            // A rejected job must never leave the graph queue waiting: drain what
-            // CUDA accepted and release the completion value from the host.
-            if(!ok){if(waited)p.cu(p.cuStreamSynchronizeFn(p.stream),"rejected VideoSuperRes drain");hr(p.completion->Signal(value),"release failed VideoSuperRes job");}
-        }else hr(p.completion->Signal(value),"release VideoSuperRes without CUDA context");
+    p.jobs.push_back(value);
+    if(!hr(queue->Wait(p.completion.Get(),value),"queue wait VideoSuperRes completion")){
+        p.jobs.pop_back();
+        return false;
     }
-    if(!hr(queue->Wait(p.completion.Get(),value),"queue wait VideoSuperRes completion"))return false;
-    if(!ok)p.ready=false;
-    return ok;
+    p.queuedFence=value;
+    ++p.outstanding;
+    p.jobsChanged.notify_one();
+    return true;
 #else
     (void)queue;return false;
 #endif
@@ -291,7 +397,7 @@ bool VfxSrBackend::run(ID3D12CommandQueue* queue){
 
 void VfxSrBackend::shutdown(){
 #ifdef VEYRA_HAVE_CUDA_DRIVER_HEADERS
-    auto& p=*impl_;p.ready=false;
+    auto& p=*impl_;p.ready=false;p.stopWorker();
     if(p.cudaContext&&p.cuCtxPushCurrentFn&&p.cuCtxPopCurrentFn){
         Impl::Current current(p);
         if(current.active){

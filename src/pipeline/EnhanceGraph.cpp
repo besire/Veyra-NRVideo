@@ -2271,6 +2271,12 @@ bool EnhanceGraph::createComputePasses()
 
 bool EnhanceGraph::submitGraph(uint32_t slot) {
     if(!ring_.submitAndSignal(slot))return false;
+    // Any direct-upload capture buffer read on this list is finished once this
+    // submission's signal completes (well before later SR/FG passes finish).
+    if(pendingCaptureUpload_){
+        pendingCaptureUpload_->gpuRead(context_.fence(),ring_.lastSignaledValue());
+        pendingCaptureUpload_=nullptr;
+    }
     for(auto& layer:nrInstances_)if(layer->amd && !layer->amd->retireSubmitted()) { failedBackend_=engine::FailedBackend::Nr; return false; }
     return true;
 }
@@ -2960,8 +2966,12 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     }
     hardwareInputFrames_[parity].reset();
     // Set when this frame's own upload buffer feeds the GPU copy (see
-    // CaptureUploadFrame.h); its read fence is recorded after submission.
+    // CaptureUploadFrame.h); bound to the first list submission that read it.
     CaptureUploadFrame* gpuDirectFrame=nullptr;
+    struct ClearPendingCaptureUpload {
+        CaptureUploadFrame*& ptr;
+        ~ClearPendingCaptureUpload() { ptr = nullptr; }
+    } clearPendingUpload{pendingCaptureUpload_};
     if(frame->format==AV_PIX_FMT_D3D12||frame->format==AV_PIX_FMT_D3D11){
         auto* retained=av_frame_clone(frame);
         if(!retained)return false;
@@ -3055,6 +3065,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         src.pResource=gpuDirectFrame?gpuDirectFrame->resource.Get():upRgb_[parity].Get();src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src.PlacedFootprint.Footprint={DXGI_FORMAT_R8G8B8A8_UNORM,ingressTexels,srcH_,1,gpuDirectFrame?gpuDirectFrame->pitch:UINT(rgbPitch_)};
         list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        pendingCaptureUpload_=gpuDirectFrame;
         tracker_.transition(list,rgbTex_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     } else if (frame->format == AV_PIX_FMT_D3D12 || frame->format == AV_PIX_FMT_D3D11) {
         // Two hardware sources feed the same import: D3D12VA hands the surface
@@ -3211,6 +3222,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
                   srcW_, srcH_, gpuDirectFrame?gpuDirectFrame->pitch:static_cast<UINT>(lumaPitch_));
         copyPlane(chromaTex_.Get(), gpuDirectFrame?gpuDirectFrame->resource.Get():upChroma_[parity].Get(), desc_.wideYuvInput()?DXGI_FORMAT_R16G16_UNORM:DXGI_FORMAT_R8G8_UNORM,
                   (srcW_+1)/2, (srcH_+1)/2, gpuDirectFrame?gpuDirectFrame->pitch:static_cast<UINT>(chromaPitch_), gpuDirectFrame?gpuDirectFrame->chromaOffset:0);
+        pendingCaptureUpload_=gpuDirectFrame;
         tracker_.transition(list, lumaTex_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         tracker_.transition(list, chromaTex_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
@@ -3383,6 +3395,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         tracker_.transition(list,input,D3D12_RESOURCE_STATE_COMMON);
         if(!submitGraph(slot))return false;
         if(!vfx.run(ring_.queue())){failedBackend_=engine::FailedBackend::Sr;return false;}
+        if(previewCheckpoint&&!reset)previewCheckpoint();
         list=ring_.acquireNext(slot,st);if(!list)return false;
         tracker_.transition(list,output,D3D12_RESOURCE_STATE_COPY_DEST);
         if(!vfx.copyOut(list,output)){failedBackend_=engine::FailedBackend::Sr;return false;}
@@ -4281,6 +4294,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     if(!runFg)gpuTimer_.submitted(ring_.lastSignaledValue());
     out.videoFenceValue = ring_.lastSignaledValue();
     out.videoFenceObject = context_.fence();
+    if(previewCheckpoint&&!reset)previewCheckpoint();
 
     // FG reads enhanced SDR color, not the pre-NR guidance input.
     if (runFg && fgCreated()) {
@@ -4430,9 +4444,9 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     // transition videoFrame_[parity] back to COMMON. Recording it before FG
     // (sweep A2, tried 2026-09-22) raised cross-queue barrier errors.
     uploadFences_[parity]=ring_.lastSignaledValue();
-    // The capture callback must not rewrite this frame's buffer before the
-    // lists submitted above have read it.
-    if(gpuDirectFrame)gpuDirectFrame->gpuRead(context_.fence(),uploadFences_[parity]);
+    // Fallback only: submitGraph already records the read fence on the first list
+    // submission that reads a direct-upload frame.
+    if(pendingCaptureUpload_){pendingCaptureUpload_->gpuRead(context_.fence(),uploadFences_[parity]);pendingCaptureUpload_=nullptr;}
 
     prevPtsMs_ = ptsMs;
     prevValid_ = true;
@@ -4739,6 +4753,7 @@ ID3D12Resource* EnhanceGraph::generatedFrameResource(uint32_t slot) const
 void EnhanceGraph::shutdown()
 {
     pausedNrCacheValid_=pausedNrResidualOnly_=false;pausedNrFrame_=nullptr;
+    pendingCaptureUpload_=nullptr;
     lastAppliedSettings_.reset();pausedNrSettings_.reset();
     if (!initialized_ && !coreHost_ && !nrAdapter_ && !nvof_ && !srcRgba_) return;
     for(unsigned i=0;i<2;++i)if(presentationFences_[i]){

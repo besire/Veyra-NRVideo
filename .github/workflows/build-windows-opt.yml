@@ -228,7 +228,7 @@ jobs:
 
           cmake --preset x64-release ^
             -B "%CI_VEYRA_BUILD_DIR_CMAKE%" ^
-            -DVEYRA_DISPLAY_VERSION=2.2.0-rtx5080-opt ^
+            -DVEYRA_DISPLAY_VERSION=2.2.0-rtx5080-opt2 ^
             -DVEYRA_BUILD_QML_UI=ON ^
             -DVEYRA_ENABLE_EXPERIMENTAL_DLSSNR=ON ^
             -DVEYRA_ENABLE_LIBDOVI=OFF ^
@@ -287,7 +287,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $buildDir = $env:CI_VEYRA_BUILD_DIR_WIN
-          $overlay = Join-Path $env:RUNNER_TEMP 'artifact\veyra-2.2.0-rtx5080-opt-overlay'
+          $overlay = Join-Path $env:RUNNER_TEMP 'artifact\veyra-2.2.0-rtx5080-opt2-overlay'
           if (Test-Path -LiteralPath $overlay) { Remove-Item -LiteralPath $overlay -Recurse -Force }
           New-Item -ItemType Directory -Force -Path $overlay, (Join-Path $overlay 'shaders'), (Join-Path $overlay 'tests') | Out-Null
 
@@ -367,8 +367,11 @@ jobs:
                D:\Veyra-Opt-Test\versions\2.2.0\veyra_qml_ui.exe --data-dir D:\Veyra-Opt-Test\test-data
 
           Notes:
-          - Local builds omit Veyra's release Ed25519 auto-update public key and libdovi (Dolby Vision RPU); capture-card HDR10 / PS5 GTA 6 pipelines are unaffected.
+          - Local builds omit Veyra's release Ed25519 auto-update public key and libdovi (Dolby Vision RPU); capture-card HDR10 / PS5 pipelines are unaffected.
           - To run the standalone RTX 5080 verification binaries under tests\, copy the desired test .exe into versions\2.2.0\ beside veyra_qml_ui.exe and shaders\ before running.
+          - A/B troubleshooting env vars (normally unset / enabled by default):
+              VEYRA_TEST_VFX_SR_SYNC=1            revert VfxSrBackend to synchronous submission
+              VEYRA_TEST_NO_HDR_PROCESS_PRESENT=1 disable HDR process-checkpoint frame presentation
           '@
           $readme | Set-Content -LiteralPath (Join-Path $overlay 'README-INSTALL.txt') -Encoding UTF8
 
@@ -385,7 +388,7 @@ jobs:
       - name: Upload Windows x64 overlay artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: veyra-2.2.0-rtx5080-opt-win64
-          path: ${{ runner.temp }}/artifact/veyra-2.2.0-rtx5080-opt-overlay
+          name: veyra-2.2.0-rtx5080-opt2-win64
+          path: ${{ runner.temp }}/artifact/veyra-2.2.0-rtx5080-opt2-overlay
           if-no-files-found: error
           retention-days: 30

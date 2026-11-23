@@ -52,7 +52,7 @@ struct SwsContext;
 struct NVSDK_NGX_Parameter;
 struct NVSDK_NGX_Handle;
 namespace veyra::guidance { class AmdOpticalFlow; class GpuDisOpticalFlow; }
-namespace veyra::pipeline { class VfgBackend; class VfxSrBackend; }
+namespace veyra::pipeline { class VfgBackend; class VfxSrBackend; struct CaptureUploadFrame; }
 
 namespace veyra::gfx {
 class D3D12DeviceContext;
@@ -1221,6 +1221,7 @@ private:
     std::weak_ptr<FrameLease> realLeases_[2],generatedLeases_[kGeneratedPoolSlots];
     uint32_t nextListSlot_ = 0;
     uint64_t uploadFences_[2] = {};
+    CaptureUploadFrame* pendingCaptureUpload_ = nullptr;
     std::array<Microsoft::WRL::ComPtr<ID3D12Fence>,2> presentationFences_;
     std::array<uint64_t,2> presentationValues_{};
     // FFmpeg may recycle a hardware surface as soon as its AVFrame is freed.
