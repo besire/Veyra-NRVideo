@@ -27,30 +27,34 @@ Rail findRail(int2 p, int2 outward, int2 along, int radius, int probe, float edg
     Rail result = {0, 0, 0};
     const int2 limit = int2(width, height);
     const int2 extent = abs(outward) * (probe + 1) + abs(along) * int(cellSize);
-    [loop] for (int i = int(cellSize / 2) + 1; i <= radius; ++i) {
+    bool done = false;
+    for (int i = int(cellSize / 2) + 1; i <= radius && !done; ++i) {
         const int2 q = p + outward * i;
-        if (any(q - extent < 0) || any(q + extent >= limit)) break;
-        const float2 center = stateTex[q];
-        if (center.x < 0.88 || center.y < edge) continue;
-
-        const float luminance = lumaAt(q);
-        const float sideA = luminance - lumaAt(q + outward * probe);
-        const float sideB = luminance - lumaAt(q - outward * probe);
-        if (sideA * sideB <= 0 || min(abs(sideA), abs(sideB)) < edge) continue;
-
-        const int2 span = along * int(cellSize);
-        const float2 left = stateTex[q - span];
-        const float2 right = stateTex[q + span];
-        if (min(left.x, right.x) < 0.88 || min(left.y, right.y) < edge ||
-            max(abs(lumaAt(q - span) - luminance), abs(lumaAt(q + span) - luminance)) > edge * 0.5)
-            continue;
-
-        const int2 inset = q - outward * (probe + 1);
-        if (stateTex[inset].x < 0.88) continue;
-        result.distance = i;
-        result.luminance = luminance;
-        result.inset = lumaAt(inset);
-        return result;
+        if (any(q - extent < 0) || any(q + extent >= limit)) {
+            done = true;
+        } else {
+            const float2 center = stateTex[q];
+            if (!(center.x < 0.88 || center.y < edge)) {
+                const float luminance = lumaAt(q);
+                const float sideA = luminance - lumaAt(q + outward * probe);
+                const float sideB = luminance - lumaAt(q - outward * probe);
+                if (!(sideA * sideB <= 0 || min(abs(sideA), abs(sideB)) < edge)) {
+                    const int2 span = along * int(cellSize);
+                    const float2 left = stateTex[q - span];
+                    const float2 right = stateTex[q + span];
+                    if (!(min(left.x, right.x) < 0.88 || min(left.y, right.y) < edge ||
+                          max(abs(lumaAt(q - span) - luminance), abs(lumaAt(q + span) - luminance)) > edge * 0.5)) {
+                        const int2 inset = q - outward * (probe + 1);
+                        if (!(stateTex[inset].x < 0.88)) {
+                            result.distance = i;
+                            result.luminance = luminance;
+                            result.inset = lumaAt(inset);
+                            done = true;
+                        }
+                    }
+                }
+            }
+        }
     }
     return result;
 }
@@ -75,13 +79,14 @@ bool shouldProtect(int2 p, int2 normal, int2 along, int radius, int probe, float
     const float inset = (a.inset + b.inset) * 0.5;
     const int offsets[3] = {-int(cellSize / 2), 0, int((cellSize - 1) / 2)};
     // Corners keep one-pixel strokes at cell boundaries from slipping through.
+    bool changed = false;
     [unroll] for (int v = 0; v < 3; ++v) {
         [unroll] for (int u = 0; u < 3; ++u) {
-            if (changesOverInset(p + normal * offsets[v] + along * offsets[u], inset, edge))
-                return true;
+            if (!changed && changesOverInset(p + normal * offsets[v] + along * offsets[u], inset, edge))
+                changed = true;
         }
     }
-    return false;
+    return changed;
 }
 
 [numthreads(8, 8, 1)]

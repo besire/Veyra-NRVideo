@@ -9,13 +9,23 @@ cbuffer Constants : register(b0) {
 
 int seekCell(int2 p, int2 step, float orientation, int count) {
     const int2 limits = int2(maskWidth, maskHeight);
-    [loop] for (int i = 1; i <= count; ++i) {
-        const int2 q = p + i * step;
-        if (any(q < 0) || any(q >= limits)) break;
-        const float value = candidates[q];
-        if (value > 0.25) return abs(value - orientation) < 0.1 ? i : 0;
+    int found = 0;
+    bool done = false;
+    [unroll] for (int i = 1; i <= 4; ++i) {
+        if (!done && i <= count) {
+            const int2 q = p + i * step;
+            if (any(q < 0) || any(q >= limits)) {
+                done = true;
+            } else {
+                const float value = candidates[q];
+                if (value > 0.25) {
+                    found = abs(value - orientation) < 0.1 ? i : 0;
+                    done = true;
+                }
+            }
+        }
     }
-    return 0;
+    return found;
 }
 
 bool shortGap(int2 p, int2 axis, float orientation) {

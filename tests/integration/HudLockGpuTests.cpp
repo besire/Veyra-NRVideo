@@ -978,6 +978,48 @@ void diagWarpDynamicIsolation() {
     runProbe("H-dynamic-only-R8-reset0", [&](Gpu& g, ProbeHold& hold) { return runDynamicOnly(g, hold, DXGI_FORMAT_R8_UNORM, 0u); });
     runProbe("I-dynamic-only-R16F", [&](Gpu& g, ProbeHold& hold) { return runDynamicOnly(g, hold, DXGI_FORMAT_R16_FLOAT, 1u); });
     runProbe("J-fill-only-R16F", [&](Gpu& g, ProbeHold& hold) { return runFillOnly(g, hold, DXGI_FORMAT_R16_FLOAT); });
+
+    auto runSimple8x8 = [](Gpu& g, ProbeHold& hold, const char* shader, DXGI_FORMAT dstFmt,
+                          UINT constants, bool clampSamplers, const float* cVals) -> bool {
+        constexpr uint32_t MW = 129, MH = 73;
+        auto* device = g.device.Get();
+        auto src = pipeline::makeTexture(device, MW, MH, DXGI_FORMAT_R8G8B8A8_UNORM, false);
+        auto dst = pipeline::makeTexture(device, MW, MH, dstFmt, true);
+        if (!src || !dst) return false;
+        hold.resources.push_back(src);
+        hold.resources.push_back(dst);
+        std::vector<uint8_t> cs;
+        auto passPtr = std::make_unique<pipeline::ComputePass>();
+        auto& pass = *passPtr;
+        pipeline::DescriptorStager stager;
+        if (!pass.loadShader(shader, cs) || !pass.create(device, cs, 2, 1, 1, constants, 0, clampSamplers) ||
+            !stager.initialize(device, 8)) {
+            return false;
+        }
+        hold.passes.push_back(std::move(passPtr));
+        stager.stageSrv(src.Get(), nullptr, pass.heap.Get(), 0);
+        pipeline::makeUav(device, dst.Get(), dstFmt, pipeline::cpuHandleOf(pass, 1));
+        if (!g.begin()) return false;
+        pipeline::StateTracker st;
+        st.transition(g.list.Get(), src.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        st.transition(g.list.Get(), dst.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        pass.bind(g.list.Get(), cVals, pipeline::gpuHandleOf(pass, 0).ptr, pipeline::gpuHandleOf(pass, 1).ptr);
+        g.list->Dispatch((MW + 7) / 8, (MH + 7) / 8, 1);
+        st.uavBarrier(g.list.Get(), dst.Get());
+        st.transition(g.list.Get(), dst.Get(), D3D12_RESOURCE_STATE_COMMON);
+        return g.submitAndWait(5000);
+    };
+    runProbe("K-AaLuma-8x8-scalarFloat-R8", [&](Gpu& g, ProbeHold& hold) {
+        float c[16]{};
+        c[0] = std::bit_cast<float>(129u); c[1] = std::bit_cast<float>(73u); c[4] = 1.0f;
+        return runSimple8x8(g, hold, "AaLuma.dxil", DXGI_FORMAT_R8_UNORM, 16, true, c);
+    });
+    runProbe("L-ColorDetailBlur-8x8-float4", [&](Gpu& g, ProbeHold& hold) {
+        float c[8]{};
+        c[0] = std::bit_cast<float>(129u); c[1] = std::bit_cast<float>(73u);
+        c[2] = std::bit_cast<float>(int32_t(1)); c[3] = std::bit_cast<float>(int32_t(0));
+        return runSimple8x8(g, hold, "ColorDetailBlur.dxil", DXGI_FORMAT_R8G8B8A8_UNORM, 8, false, c);
+    });
 }
 
 } // namespace
