@@ -965,7 +965,7 @@ if(VEYRA_FFMPEG_ROOT AND EXISTS "${VEYRA_FFMPEG_ROOT}/include/libavformat/avform
   target_compile_options(veyra_hud_lock_gpu_tests PRIVATE /utf-8)
   target_compile_definitions(veyra_hud_lock_gpu_tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_link_libraries(veyra_hud_lock_gpu_tests PRIVATE veyra_pipeline d3d12 dxgi)
-  add_dependencies(veyra_hud_lock_gpu_tests veyra_shader_hud_lock_update veyra_shader_hud_lock_compose)
+  add_dependencies(veyra_hud_lock_gpu_tests veyra_shader_hud_lock_update veyra_shader_hud_lock_dynamic veyra_shader_hud_lock_fill veyra_shader_hud_lock_compose)
   # NVENC recording tuning (two-pass, psycho-visual AQ; options from PushFPS).
   add_executable(veyra_nvenc_tuning_tests tests/integration/NvencTuningTests.cpp)
   target_compile_features(veyra_nvenc_tuning_tests PRIVATE cxx_std_20)

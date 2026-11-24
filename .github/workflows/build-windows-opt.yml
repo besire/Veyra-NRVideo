@@ -217,13 +217,13 @@ jobs:
             "$($kv.Key)=$($kv.Value)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
 
-      - name: Configure and build veyra_qml_ui and tests (MSVC 2022 Release x64)
+      - name: Configure and build fast verification tests (MSVC 2022 Release x64)
         shell: cmd
         run: |
           @echo off
           set "VSLANG=1033"
           call "%CI_VEYRA_VSROOT%\VC\Auxiliary\Build\vcvars64.bat"
-          if errorlevel 1 exit /b 4
+          if %errorlevel% neq 0 exit /b 4
           chcp 65001 >nul
 
           cmake --preset x64-release ^
@@ -246,54 +246,103 @@ jobs:
             -DOPENSSL_USE_STATIC_LIBS=%CI_VEYRA_OSSL_STATIC% ^
             -DOPENSSL_MSVC_STATIC_RT=%CI_VEYRA_OSSL_STATIC% ^
             -DCMAKE_PREFIX_PATH="%CI_VEYRA_QT_ROOT%"
-          if errorlevel 1 exit /b 5
+          if %errorlevel% neq 0 exit /b 5
 
           findstr /C:"VEYRA_HAVE_CUDA_DRIVER_HEADERS=1" "%CI_VEYRA_BUILD_DIR_WIN%\build.ninja" >nul
-          if errorlevel 1 (
+          if %errorlevel% neq 0 (
             echo ERROR: VEYRA_HAVE_CUDA_DRIVER_HEADERS=1 not active in build.ninja
             exit /b 5
           )
 
           cmake --build "%CI_VEYRA_BUILD_DIR_CMAKE%" --parallel 4 --target ^
-            veyra_qml_ui ^
             veyra_live_timing_tests ^
             veyra_capture_color_tests ^
             veyra_hud_lock_gpu_tests ^
-            veyra_sr_quality_tests ^
-            veyra_hdr_enhancement_tests
-          if errorlevel 1 exit /b 6
+            veyra_shader_hud_lock_update ^
+            veyra_shader_hud_lock_dynamic ^
+            veyra_shader_hud_lock_fill ^
+            veyra_shader_hud_lock_compose
+          if %errorlevel% neq 0 exit /b 6
 
-          ninja -C "%CI_VEYRA_BUILD_DIR_WIN%" -t targets all > "%RUNNER_TEMP%\targets.txt"
-          if errorlevel 1 exit /b 7
-          for /f "usebackq delims=" %%S in (`pwsh -NoProfile -Command "(Get-Content (Join-Path $env:RUNNER_TEMP 'targets.txt') | ForEach-Object { ($_ -split ':')[0] } | Where-Object { $_ -match '^veyra_shader_' } | Sort-Object -Unique) -join ' '"`) do set "VEYRA_SHADER_TARGETS=%%S"
-          if defined VEYRA_SHADER_TARGETS (
-            cmake --build "%CI_VEYRA_BUILD_DIR_CMAKE%" --parallel 4 --target %VEYRA_SHADER_TARGETS%
-            if errorlevel 1 exit /b 7
-          )
+      - name: Run CPU and WARP D3D12 verification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $env:PATH = "$($env:CI_VEYRA_FFMPEG_BIN_WIN);$($env:CI_VEYRA_QT_BIN_WIN);$($env:CI_VEYRA_OSSL_BIN_WIN);$($env:PATH)"
+          $env:VEYRA_HUD_LOCK_GPU_DEBUG = '1'
+          $buildDir = $env:CI_VEYRA_BUILD_DIR_WIN
 
-      - name: Run CPU and WARP D3D12 verification + inspect DLL dependents
+          function Invoke-VerifiedTest([string]$Name, [string]$ExePath, [scriptblock]$AssertOutput) {
+            Write-Host "=== Running $Name ==="
+            if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
+              throw "Missing test executable: $ExePath"
+            }
+            $lines = & $ExePath 2>&1 | ForEach-Object {
+              $s = $_.ToString()
+              Write-Host $s
+              $s
+            }
+            $code = $LASTEXITCODE
+            if ($code -ne 0) {
+              throw "$Name exited with non-zero code $code (0x$('{0:X8}' -f ($code -band 0xFFFFFFFF)))"
+            }
+            $text = $lines -join "`n"
+            & $AssertOutput $text $lines
+          }
+
+          Invoke-VerifiedTest 'veyra_live_timing_tests.exe (AVX2 + dedup)' (Join-Path $buildDir 'veyra_live_timing_tests.exe') {
+            param($text, $lines)
+            if ($text -notmatch 'PICTURE_TIMING') {
+              throw 'veyra_live_timing_tests.exe missing PICTURE_TIMING output'
+            }
+            $bad = $lines | Where-Object { $_ -match '^\s*FAIL(\s|:|$)' }
+            if ($bad) {
+              throw "veyra_live_timing_tests.exe emitted FAIL: $($bad | Select-Object -First 1)"
+            }
+          }
+
+          Invoke-VerifiedTest 'veyra_capture_color_tests.exe (CaptureMediaType contiguous copy)' (Join-Path $buildDir 'veyra_capture_color_tests.exe') {
+            param($text, $lines)
+            if ($text -notmatch 'failures=0\b') {
+              throw 'veyra_capture_color_tests.exe did not report failures=0'
+            }
+          }
+
+          Invoke-VerifiedTest 'veyra_hud_lock_gpu_tests.exe (D3D12 WARP + debug layer)' (Join-Path $buildDir 'veyra_hud_lock_gpu_tests.exe') {
+            param($text, $lines)
+            foreach ($needle in @('PASSED: 0 failure(s)', 'inPlace=1', 'INFO hud lock 4k-edge', 'INFO combined HDR10 HUD:')) {
+              if ($text -notmatch [regex]::Escape($needle)) {
+                throw "veyra_hud_lock_gpu_tests.exe output missing '$needle'"
+              }
+            }
+          }
+
+      - name: Build veyra_qml_ui, remaining tests and shaders + inspect DLL dependents
         shell: cmd
         run: |
           @echo off
+          set "VSLANG=1033"
           call "%CI_VEYRA_VSROOT%\VC\Auxiliary\Build\vcvars64.bat"
-          if errorlevel 1 exit /b 4
+          if %errorlevel% neq 0 exit /b 4
 
-          set "PATH=%CI_VEYRA_FFMPEG_BIN_WIN%;%CI_VEYRA_QT_BIN_WIN%;%CI_VEYRA_OSSL_BIN_WIN%;%PATH%"
-          echo === Running veyra_live_timing_tests.exe (AVX2 + dedup) ===
-          "%CI_VEYRA_BUILD_DIR_WIN%\veyra_live_timing_tests.exe"
-          if errorlevel 1 exit /b 11
+          cmake --build "%CI_VEYRA_BUILD_DIR_CMAKE%" --parallel 4 --target ^
+            veyra_qml_ui ^
+            veyra_sr_quality_tests ^
+            veyra_hdr_enhancement_tests
+          if %errorlevel% neq 0 exit /b 8
 
-          echo === Running veyra_capture_color_tests.exe (CaptureMediaType contiguous copy) ===
-          "%CI_VEYRA_BUILD_DIR_WIN%\veyra_capture_color_tests.exe"
-          if errorlevel 1 exit /b 12
-
-          echo === Running veyra_hud_lock_gpu_tests.exe (D3D12 WARP) ===
-          "%CI_VEYRA_BUILD_DIR_WIN%\veyra_hud_lock_gpu_tests.exe"
-          if errorlevel 1 exit /b 13
+          ninja -C "%CI_VEYRA_BUILD_DIR_WIN%" -t targets all > "%RUNNER_TEMP%\targets.txt"
+          if %errorlevel% neq 0 exit /b 7
+          for /f "usebackq delims=" %%S in (`pwsh -NoProfile -Command "(Get-Content (Join-Path $env:RUNNER_TEMP 'targets.txt') | ForEach-Object { ($_ -split ':')[0] } | Where-Object { $_ -match '^veyra_shader_' } | Sort-Object -Unique) -join ' '"`) do set "VEYRA_SHADER_TARGETS=%%S"
+          if not defined VEYRA_SHADER_TARGETS goto :shaders_done
+          cmake --build "%CI_VEYRA_BUILD_DIR_CMAKE%" --parallel 4 --target %VEYRA_SHADER_TARGETS%
+          if %errorlevel% neq 0 exit /b 7
+          :shaders_done
 
           echo === Inspecting veyra_qml_ui.exe dependents ===
           dumpbin /dependents "%CI_VEYRA_BUILD_DIR_WIN%\veyra_qml_ui.exe"
-          if errorlevel 1 exit /b 14
+          if %errorlevel% neq 0 exit /b 14
 
       - name: Stage overlay package for portable Veyra 2.2.1
         shell: pwsh
