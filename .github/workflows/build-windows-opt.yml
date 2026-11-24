@@ -280,9 +280,6 @@ jobs:
             }
             $lines = & $ExePath 2>&1 | ForEach-Object {
               $s = $_.ToString()
-              if ($s -match '=== WARP Dynamic HUD Isolation Diagnostics ===') {
-                $script:hudSawDiag = $true
-              }
               Write-Host $s
               $s
             }
@@ -312,26 +309,13 @@ jobs:
             }
           }
 
-          $hudExe = Join-Path $buildDir 'veyra_hud_lock_gpu_tests.exe'
-          try {
-            $script:hudSawDiag = $false
-            Invoke-VerifiedTest 'veyra_hud_lock_gpu_tests.exe (D3D12 WARP + debug layer)' $hudExe {
-              param($text, $lines)
-              if ($text -match '=== WARP Dynamic HUD Isolation Diagnostics ===') {
-                $script:hudSawDiag = $true
-              }
-              foreach ($needle in @('PASSED: 0 failure(s)', 'inPlace=1', 'INFO hud lock 4k-edge', 'INFO combined HDR10 HUD:')) {
-                if ($text -notmatch [regex]::Escape($needle)) {
-                  throw "veyra_hud_lock_gpu_tests.exe output missing '$needle'"
-                }
+          Invoke-VerifiedTest 'veyra_hud_lock_gpu_tests.exe (D3D12 WARP + debug layer)' (Join-Path $buildDir 'veyra_hud_lock_gpu_tests.exe') {
+            param($text, $lines)
+            foreach ($needle in @('PASSED: 0 failure(s)', 'inPlace=1', 'INFO hud lock 4k-edge', 'INFO combined HDR10 HUD:')) {
+              if ($text -notmatch [regex]::Escape($needle)) {
+                throw "veyra_hud_lock_gpu_tests.exe output missing '$needle'"
               }
             }
-          } catch {
-            if (-not $script:hudSawDiag -and (Test-Path -LiteralPath $hudExe -PathType Leaf)) {
-              Write-Host '=== Running fallback --diag-warp after hud_lock failure ==='
-              & $hudExe --diag-warp 2>&1 | ForEach-Object { Write-Host $_.ToString() }
-            }
-            throw
           }
 
       - name: Build veyra_qml_ui, remaining tests and shaders + inspect DLL dependents

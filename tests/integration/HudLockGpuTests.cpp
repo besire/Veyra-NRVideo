@@ -17,8 +17,6 @@
 #include "veyra/pipeline/HudLock.h"
 #include "veyra/pipeline/GpuPassUtils.h"
 #include <algorithm>
-#include <bit>
-#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -716,319 +714,37 @@ void testCombinedStaticAndDynamicHdr10Hud(Gpu& gpu) {
     check(staticTotal > 0 && staticHeld >= staticTotal * 95 / 100,
           "combined HDR10 HUD: static HUD held alongside dynamic mask");
     check(spill == 0, "combined HDR10 HUD: moving scenery stays untouched");
-    check(uploadAndRun(64, false, false) && fixture.compose(1) == fixture.placeholder,
-          "combined HDR10 HUD: removal releases both static and dynamic locks");
-    check(!gpu.debugErrors(), "combined HDR10 HUD: no D3D12 debug errors");
-}
-
-void diagWarpDynamicIsolation() {
-    std::printf("=== WARP Dynamic HUD Isolation Diagnostics ===\n");
+    const bool removedRun = uploadAndRun(64, false, false);
+    const auto afterRemoval = removedRun ? fixture.compose(1) : std::vector<uint8_t>{};
+    size_t dynReleased = 0, dynRegionTotal = 0, staticReleased = 0, staticRegionTotal = 0;
+    if (afterRemoval.size() == fixture.placeholder.size()) {
+        for (uint32_t y = 0; y < H; ++y)
+            for (uint32_t x = 0; x < W; ++x) {
+                const size_t at = (size_t(y) * W + x) * 4;
+                const bool keptPlaceholder = std::memcmp(afterRemoval.data() + at, fixture.placeholder.data() + at, 4) == 0;
+                if (x >= W / 9 && x < W / 2 && y >= start && y <= start + 6 * cell) {
+                    ++dynRegionTotal;
+                    dynReleased += keptPlaceholder;
+                } else if (staticAt(x, y)) {
+                    ++staticRegionTotal;
+                    staticReleased += keptPlaceholder;
+                }
+            }
+    }
+    std::printf("INFO combined HDR10 HUD removal: dyn %zu/%zu, static %zu/%zu\n",
+                dynReleased, dynRegionTotal, staticReleased, staticRegionTotal);
     std::fflush(stdout);
-    struct ProbeHold {
-        std::vector<ComPtr<ID3D12Resource>> resources;
-        std::vector<std::unique_ptr<pipeline::ComputePass>> passes;
-        std::unique_ptr<pipeline::HudLock> lock;
-        std::unique_ptr<DynamicHudFixture> fx;
-    };
-    auto elapsedMs = [](std::chrono::steady_clock::time_point t0) {
-        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    };
-    auto runProbe = [&elapsedMs](const char* label, auto&& fn) {
-        auto pGpu = std::make_unique<Gpu>();
-        auto hold = std::make_unique<ProbeHold>();
-        if (!pGpu->create()) {
-            std::printf("DIAG %s: device creation failed\n", label);
-            std::fflush(stdout);
-            return;
-        }
-        const auto t0 = std::chrono::steady_clock::now();
-        const bool ok = fn(*pGpu, *hold);
-        const double ms = elapsedMs(t0);
-        const HRESULT removed = pGpu->device ? pGpu->device->GetDeviceRemovedReason() : E_FAIL;
-        const bool dbgErr = pGpu->debugErrors(true);
-        std::printf("DIAG %s: ok=%d hung=%d ms=%.1f removed=0x%08X dbgErr=%d\n",
-                    label, ok ? 1 : 0, pGpu->hung ? 1 : 0, ms, static_cast<unsigned>(removed), dbgErr ? 1 : 0);
-        std::fflush(stdout);
-        if (pGpu->hung) {
-            hold.release();
-            pGpu.release();
-        }
-    };
-
-    auto runDynamicOnly = [&elapsedMs](Gpu& g, ProbeHold& hold, DXGI_FORMAT maskFmt, uint32_t resetVal) -> bool {
-        constexpr uint32_t W = 257, H = 145, cell = 2;
-        const uint32_t MW = (W + cell - 1) / cell, MH = (H + cell - 1) / cell;
-        auto* device = g.device.Get();
-        D3D12_FEATURE_DATA_FORMAT_SUPPORT caps{maskFmt};
-        const HRESULT capsHr = device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &caps, sizeof(caps));
-        std::printf("  DIAG dynamic caps fmt=%d hr=0x%08X s1=0x%X s2=0x%X\n",
-                    int(maskFmt), static_cast<unsigned>(capsHr), unsigned(caps.Support1), unsigned(caps.Support2));
-        std::fflush(stdout);
-        auto real0 = pipeline::makeTexture(device, W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true);
-        auto real1 = pipeline::makeTexture(device, W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true);
-        auto state = pipeline::makeTexture(device, W, H, DXGI_FORMAT_R16G16_FLOAT, true);
-        auto mask = pipeline::makeTexture(device, MW, MH, maskFmt, true);
-        if (!real0 || !real1 || !state || !mask) return false;
-        hold.resources.push_back(real0);
-        hold.resources.push_back(real1);
-        hold.resources.push_back(state);
-        hold.resources.push_back(mask);
-        std::vector<uint8_t> cs;
-        auto passPtr = std::make_unique<pipeline::ComputePass>();
-        auto& pass = *passPtr;
-        pipeline::DescriptorStager stager;
-        const auto tPso0 = std::chrono::steady_clock::now();
-        if (!pass.loadShader("HudLockDynamic.dxil", cs) || !pass.create(device, cs, 8, 3, 1, 8) ||
-            !stager.initialize(device, 16)) {
-            return false;
-        }
-        const double tPso = elapsedMs(tPso0);
-        hold.passes.push_back(std::move(passPtr));
-        stager.stageSrv(real0.Get(), nullptr, pass.heap.Get(), 0);
-        stager.stageSrv(state.Get(), nullptr, pass.heap.Get(), 1);
-        stager.stageSrv(real1.Get(), nullptr, pass.heap.Get(), 2);
-        pipeline::makeUav(device, mask.Get(), maskFmt, pipeline::cpuHandleOf(pass, 3));
-        if (!g.begin()) return false;
-        pipeline::StateTracker st;
-        st.transition(g.list.Get(), real0.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        st.transition(g.list.Get(), real1.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        st.transition(g.list.Get(), state.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        st.transition(g.list.Get(), mask.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        const float c[8]{
-            std::bit_cast<float>(W), std::bit_cast<float>(H), std::bit_cast<float>(resetVal), 0.0f,
-            std::bit_cast<float>(cell), std::bit_cast<float>(MW), std::bit_cast<float>(MH), 0.0f};
-        pass.bind(g.list.Get(), c, pipeline::gpuHandleOf(pass, 0).ptr, pipeline::gpuHandleOf(pass, 3).ptr);
-        g.list->Dispatch((MW + 7) / 8, (MH + 7) / 8, 1);
-        st.uavBarrier(g.list.Get(), mask.Get());
-        st.transition(g.list.Get(), mask.Get(), D3D12_RESOURCE_STATE_COMMON);
-        const auto tExec0 = std::chrono::steady_clock::now();
-        const bool ok = g.submitAndWait(5000);
-        const double tExec = elapsedMs(tExec0);
-        std::printf("  DIAG dynamic fmt=%d reset=%u tPso=%.1fms tExec=%.1fms\n", int(maskFmt), resetVal, tPso, tExec);
-        std::fflush(stdout);
-        return ok;
-    };
-
-    auto runFillOnly = [&elapsedMs](Gpu& g, ProbeHold& hold, DXGI_FORMAT maskFmt) -> bool {
-        constexpr uint32_t MW = 129, MH = 73;
-        auto* device = g.device.Get();
-        auto dynMask = pipeline::makeTexture(device, MW, MH, maskFmt, true);
-        auto protMask = pipeline::makeTexture(device, MW, MH, maskFmt, true);
-        if (!dynMask || !protMask) return false;
-        hold.resources.push_back(dynMask);
-        hold.resources.push_back(protMask);
-        std::vector<uint8_t> cs;
-        auto passPtr = std::make_unique<pipeline::ComputePass>();
-        auto& pass = *passPtr;
-        pipeline::DescriptorStager stager;
-        const auto tPso0 = std::chrono::steady_clock::now();
-        if (!pass.loadShader("HudLockFill.dxil", cs) || !pass.create(device, cs, 2, 1, 1, 4) ||
-            !stager.initialize(device, 8)) {
-            return false;
-        }
-        const double tPso = elapsedMs(tPso0);
-        hold.passes.push_back(std::move(passPtr));
-        D3D12_SHADER_RESOURCE_VIEW_DESC maskSrv{};
-        maskSrv.Format = maskFmt;
-        maskSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        maskSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        maskSrv.Texture2D.MipLevels = 1;
-        stager.stageSrv(dynMask.Get(), &maskSrv, pass.heap.Get(), 0);
-        pipeline::makeUav(device, protMask.Get(), maskFmt, pipeline::cpuHandleOf(pass, 1));
-        if (!g.begin()) return false;
-        pipeline::StateTracker st;
-        st.transition(g.list.Get(), dynMask.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        st.transition(g.list.Get(), protMask.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        const float fc[4]{std::bit_cast<float>(MW), std::bit_cast<float>(MH), std::bit_cast<float>(1u), 0.0f};
-        pass.bind(g.list.Get(), fc, pipeline::gpuHandleOf(pass, 0).ptr, pipeline::gpuHandleOf(pass, 1).ptr);
-        g.list->Dispatch((MW + 7) / 8, (MH + 7) / 8, 1);
-        st.uavBarrier(g.list.Get(), protMask.Get());
-        st.transition(g.list.Get(), protMask.Get(), D3D12_RESOURCE_STATE_COMMON);
-        const auto tExec0 = std::chrono::steady_clock::now();
-        const bool ok = g.submitAndWait(5000);
-        const double tExec = elapsedMs(tExec0);
-        std::printf("  DIAG fill fmt=%d tPso=%.1fms tExec=%.1fms\n", int(maskFmt), tPso, tExec);
-        std::fflush(stdout);
-        return ok;
-    };
-
-    runProbe("A-update-only-257x145", [](Gpu& g, ProbeHold& hold) {
-        constexpr uint32_t W = 257, H = 145;
-        constexpr DXGI_FORMAT F = DXGI_FORMAT_R8G8B8A8_UNORM;
-        auto* device = g.device.Get();
-        Plane real0{pipeline::makeTexture(device, W, H, F, true), F, W, H, 4};
-        auto real1 = pipeline::makeTexture(device, W, H, F, true);
-        auto gen = pipeline::makeTexture(device, W, H, F, true);
-        if (!real0.texture || !real1 || !gen) return false;
-        hold.resources.push_back(real0.texture);
-        hold.resources.push_back(real1);
-        hold.resources.push_back(gen);
-        hold.lock = std::make_unique<pipeline::HudLock>();
-        if (!hold.lock->initialize(device, W, H, F, 0, true, false)) return false;
-        pipeline::DescriptorStager stager;
-        if (!stager.initialize(device, 64)) return false;
-        ID3D12Resource* reals[]{real0.texture.Get(), real1.Get()};
-        ID3D12Resource* gens[]{gen.Get()};
-        hold.lock->createViews(device, stager, reals, gens, 1);
-        if (!g.begin()) return false;
-        pipeline::StateTracker st;
-        std::vector<uint8_t> px(size_t(W) * H * 4, 100);
-        auto up = recordFill(g, real0, px, st.get(real0.texture.Get()), D3D12_RESOURCE_STATE_COMMON);
-        if (!up) {
-            g.list->Close();
-            return false;
-        }
-        hold.resources.push_back(up);
-        st.set(real0.texture.Get(), D3D12_RESOURCE_STATE_COMMON);
-        return hold.lock->update(g.list.Get(), st, 0, true) && g.submitAndWait(5000);
-    });
-    runProbe("B-dynamic-only-R8", [&](Gpu& g, ProbeHold& hold) { return runDynamicOnly(g, hold, DXGI_FORMAT_R8_UNORM, 1u); });
-    runProbe("C-fill-only-R8", [&](Gpu& g, ProbeHold& hold) { return runFillOnly(g, hold, DXGI_FORMAT_R8_UNORM); });
-    runProbe("D-update+dynamic+fill-1cmd", [](Gpu& g, ProbeHold& hold) {
-        hold.fx.reset(new DynamicHudFixture{g});
-        if (!hold.fx->initialize(257, 145, DXGI_FORMAT_R8G8B8A8_UNORM, 0, false, true)) return false;
-        return hold.fx->update(0, true, true, false, 5000);
-    });
-    runProbe("E-update+dynamic+fill-3cmds", [](Gpu& g, ProbeHold& hold) {
-        constexpr uint32_t W = 257, H = 145, cell = 2;
-        const uint32_t MW = (W + cell - 1) / cell, MH = (H + cell - 1) / cell;
-        auto* device = g.device.Get();
-        auto real0 = pipeline::makeTexture(device, W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true);
-        auto real1 = pipeline::makeTexture(device, W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true);
-        auto state = pipeline::makeTexture(device, W, H, DXGI_FORMAT_R16G16_FLOAT, true);
-        auto dynMask = pipeline::makeTexture(device, MW, MH, DXGI_FORMAT_R8_UNORM, true);
-        auto protMask = pipeline::makeTexture(device, MW, MH, DXGI_FORMAT_R8_UNORM, true);
-        if (!real0 || !real1 || !state || !dynMask || !protMask) return false;
-        hold.resources.push_back(real0);
-        hold.resources.push_back(real1);
-        hold.resources.push_back(state);
-        hold.resources.push_back(dynMask);
-        hold.resources.push_back(protMask);
-        std::vector<uint8_t> cs;
-        auto updPtr = std::make_unique<pipeline::ComputePass>();
-        auto dynPtr = std::make_unique<pipeline::ComputePass>();
-        auto flPtr = std::make_unique<pipeline::ComputePass>();
-        auto& upd = *updPtr;
-        auto& dyn = *dynPtr;
-        auto& fl = *flPtr;
-        pipeline::DescriptorStager stager;
-        if (!upd.loadShader("HudLockUpdate.dxil", cs) || !upd.create(device, cs, 6, 2, 1, 8)) return false;
-        if (!dyn.loadShader("HudLockDynamic.dxil", cs) || !dyn.create(device, cs, 8, 3, 1, 8)) return false;
-        if (!fl.loadShader("HudLockFill.dxil", cs) || !fl.create(device, cs, 2, 1, 1, 4)) return false;
-        if (!stager.initialize(device, 32)) return false;
-        hold.passes.push_back(std::move(updPtr));
-        hold.passes.push_back(std::move(dynPtr));
-        hold.passes.push_back(std::move(flPtr));
-        D3D12_SHADER_RESOURCE_VIEW_DESC maskSrv{};
-        maskSrv.Format = DXGI_FORMAT_R8_UNORM;
-        maskSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        maskSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        maskSrv.Texture2D.MipLevels = 1;
-        stager.stageSrv(real0.Get(), nullptr, upd.heap.Get(), 0);
-        stager.stageSrv(real1.Get(), nullptr, upd.heap.Get(), 1);
-        pipeline::makeUav(device, state.Get(), DXGI_FORMAT_R16G16_FLOAT, pipeline::cpuHandleOf(upd, 2));
-        stager.stageSrv(real0.Get(), nullptr, dyn.heap.Get(), 0);
-        stager.stageSrv(state.Get(), nullptr, dyn.heap.Get(), 1);
-        stager.stageSrv(real1.Get(), nullptr, dyn.heap.Get(), 2);
-        pipeline::makeUav(device, dynMask.Get(), DXGI_FORMAT_R8_UNORM, pipeline::cpuHandleOf(dyn, 3));
-        stager.stageSrv(dynMask.Get(), &maskSrv, fl.heap.Get(), 0);
-        pipeline::makeUav(device, protMask.Get(), DXGI_FORMAT_R8_UNORM, pipeline::cpuHandleOf(fl, 1));
-        pipeline::StateTracker st;
-        const float uc[8]{std::bit_cast<float>(W), std::bit_cast<float>(H), std::bit_cast<float>(1u), 0.0f, 0, 0, 0, 0};
-        const float dc[8]{std::bit_cast<float>(W), std::bit_cast<float>(H), std::bit_cast<float>(1u), 0.0f,
-                          std::bit_cast<float>(cell), std::bit_cast<float>(MW), std::bit_cast<float>(MH), 0.0f};
-        const float fc[4]{std::bit_cast<float>(MW), std::bit_cast<float>(MH), std::bit_cast<float>(1u), 0.0f};
-        if (!g.begin()) return false;
-        st.transition(g.list.Get(), real0.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        st.transition(g.list.Get(), real1.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        st.transition(g.list.Get(), state.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        upd.bind(g.list.Get(), uc, pipeline::gpuHandleOf(upd, 0).ptr, pipeline::gpuHandleOf(upd, 2).ptr);
-        g.list->Dispatch((W + 15) / 16, (H + 15) / 16, 1);
-        st.uavBarrier(g.list.Get(), state.Get());
-        st.transition(g.list.Get(), state.Get(), D3D12_RESOURCE_STATE_COMMON);
-        const bool ok1 = g.submitAndWait(5000);
-        std::printf("  DIAG E cmd1(update) ok=%d\n", ok1 ? 1 : 0);
-        std::fflush(stdout);
-        if (!ok1) return false;
-        if (!g.begin()) return false;
-        st.transition(g.list.Get(), state.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        st.transition(g.list.Get(), dynMask.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        dyn.bind(g.list.Get(), dc, pipeline::gpuHandleOf(dyn, 0).ptr, pipeline::gpuHandleOf(dyn, 3).ptr);
-        g.list->Dispatch((MW + 7) / 8, (MH + 7) / 8, 1);
-        st.uavBarrier(g.list.Get(), dynMask.Get());
-        st.transition(g.list.Get(), dynMask.Get(), D3D12_RESOURCE_STATE_COMMON);
-        const bool ok2 = g.submitAndWait(5000);
-        std::printf("  DIAG E cmd2(dynamic) ok=%d\n", ok2 ? 1 : 0);
-        std::fflush(stdout);
-        if (!ok2) return false;
-        if (!g.begin()) return false;
-        st.transition(g.list.Get(), dynMask.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        st.transition(g.list.Get(), protMask.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        fl.bind(g.list.Get(), fc, pipeline::gpuHandleOf(fl, 0).ptr, pipeline::gpuHandleOf(fl, 1).ptr);
-        g.list->Dispatch((MW + 7) / 8, (MH + 7) / 8, 1);
-        st.uavBarrier(g.list.Get(), protMask.Get());
-        st.transition(g.list.Get(), protMask.Get(), D3D12_RESOURCE_STATE_COMMON);
-        const bool ok3 = g.submitAndWait(5000);
-        std::printf("  DIAG E cmd3(fill) ok=%d\n", ok3 ? 1 : 0);
-        std::fflush(stdout);
-        return ok3;
-    });
-    runProbe("F-dynamic-only-R32F", [&](Gpu& g, ProbeHold& hold) { return runDynamicOnly(g, hold, DXGI_FORMAT_R32_FLOAT, 1u); });
-    runProbe("G-fill-only-R32F", [&](Gpu& g, ProbeHold& hold) { return runFillOnly(g, hold, DXGI_FORMAT_R32_FLOAT); });
-    runProbe("H-dynamic-only-R8-reset0", [&](Gpu& g, ProbeHold& hold) { return runDynamicOnly(g, hold, DXGI_FORMAT_R8_UNORM, 0u); });
-    runProbe("I-dynamic-only-R16F", [&](Gpu& g, ProbeHold& hold) { return runDynamicOnly(g, hold, DXGI_FORMAT_R16_FLOAT, 1u); });
-    runProbe("J-fill-only-R16F", [&](Gpu& g, ProbeHold& hold) { return runFillOnly(g, hold, DXGI_FORMAT_R16_FLOAT); });
-
-    auto runSimple8x8 = [](Gpu& g, ProbeHold& hold, const char* shader, DXGI_FORMAT dstFmt,
-                          UINT constants, bool clampSamplers, const float* cVals) -> bool {
-        constexpr uint32_t MW = 129, MH = 73;
-        auto* device = g.device.Get();
-        auto src = pipeline::makeTexture(device, MW, MH, DXGI_FORMAT_R8G8B8A8_UNORM, false);
-        auto dst = pipeline::makeTexture(device, MW, MH, dstFmt, true);
-        if (!src || !dst) return false;
-        hold.resources.push_back(src);
-        hold.resources.push_back(dst);
-        std::vector<uint8_t> cs;
-        auto passPtr = std::make_unique<pipeline::ComputePass>();
-        auto& pass = *passPtr;
-        pipeline::DescriptorStager stager;
-        if (!pass.loadShader(shader, cs) || !pass.create(device, cs, 2, 1, 1, constants, 0, clampSamplers) ||
-            !stager.initialize(device, 8)) {
-            return false;
-        }
-        hold.passes.push_back(std::move(passPtr));
-        stager.stageSrv(src.Get(), nullptr, pass.heap.Get(), 0);
-        pipeline::makeUav(device, dst.Get(), dstFmt, pipeline::cpuHandleOf(pass, 1));
-        if (!g.begin()) return false;
-        pipeline::StateTracker st;
-        st.transition(g.list.Get(), src.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        st.transition(g.list.Get(), dst.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        pass.bind(g.list.Get(), cVals, pipeline::gpuHandleOf(pass, 0).ptr, pipeline::gpuHandleOf(pass, 1).ptr);
-        g.list->Dispatch((MW + 7) / 8, (MH + 7) / 8, 1);
-        st.uavBarrier(g.list.Get(), dst.Get());
-        st.transition(g.list.Get(), dst.Get(), D3D12_RESOURCE_STATE_COMMON);
-        return g.submitAndWait(5000);
-    };
-    runProbe("K-AaLuma-8x8-scalarFloat-R8", [&](Gpu& g, ProbeHold& hold) {
-        float c[16]{};
-        c[0] = std::bit_cast<float>(129u); c[1] = std::bit_cast<float>(73u); c[4] = 1.0f;
-        return runSimple8x8(g, hold, "AaLuma.dxil", DXGI_FORMAT_R8_UNORM, 16, true, c);
-    });
-    runProbe("L-ColorDetailBlur-8x8-float4", [&](Gpu& g, ProbeHold& hold) {
-        float c[8]{};
-        c[0] = std::bit_cast<float>(129u); c[1] = std::bit_cast<float>(73u);
-        c[2] = std::bit_cast<float>(int32_t(1)); c[3] = std::bit_cast<float>(int32_t(0));
-        return runSimple8x8(g, hold, "ColorDetailBlur.dxil", DXGI_FORMAT_R8G8B8A8_UNORM, 8, false, c);
-    });
+    check(removedRun && dynRegionTotal > 0 && dynReleased == dynRegionTotal &&
+              staticRegionTotal > 0 && staticReleased == staticRegionTotal,
+          "combined HDR10 HUD: removal releases both static and dynamic locks");
+    check(uploadAndRun(65, true, true) && fixture.compose(1) == fixture.placeholder,
+          "combined HDR10 HUD: reset clears all static and dynamic locks");
+    check(!gpu.debugErrors(), "combined HDR10 HUD: no D3D12 debug errors");
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "--diag-warp") {
-        diagWarpDynamicIsolation();
-        return 0;
-    }
     auto gpuPtr = std::make_unique<Gpu>();
     Gpu& gpu = *gpuPtr;
     if (!gpu.create()) { std::printf("FAIL D3D12 device\n"); std::fflush(stdout); return 1; }
@@ -1051,9 +767,8 @@ int main(int argc, char** argv) {
     if (!gpu.hung) testHudLockHighResPartialTiles(gpu);
     if (!gpu.hung) testCombinedStaticAndDynamicHdr10Hud(gpu);
     if (gpu.hung) {
-        std::printf("NOTE Gpu queue hung; stopping further shared-queue tests and running WARP isolation diagnostics\n");
+        std::printf("NOTE Gpu queue hung; skipping remaining shared-queue tests\n");
         std::fflush(stdout);
-        diagWarpDynamicIsolation();
         gpuPtr.release();
     }
     std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);
