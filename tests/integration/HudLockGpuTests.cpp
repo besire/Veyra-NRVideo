@@ -193,6 +193,7 @@ void testHudLock(Gpu& gpu) {
     ID3D12Resource* reals[2] = {real[0].texture.Get(), real[1].texture.Get()};
     ID3D12Resource* gens[1] = {generated.texture.Get()};
     lock.createViews(device, stager, reals, gens, 1);
+    std::printf("INFO hud lock: %s\n", lock.describe().c_str());
     // HUD: x 20..100, y 10..40, high-contrast stripes that never move. Everything else moves.
     auto hudAt = [](uint32_t x, uint32_t y) { return x >= 20 && x < 100 && y >= 10 && y < 40; };
     auto picture = [&](int shift, bool hud) {
@@ -385,6 +386,7 @@ void testDynamicHud(Gpu& gpu, DXGI_FORMAT format, unsigned outputMode, bool vert
     const bool initialized = fixture.initialize(W, H, format, outputMode);
     check(initialized, name + ": passes created");
     if (!initialized) return;
+    std::printf("INFO %s: %s\n", name.c_str(), fixture.lock.describe().c_str());
     const bool first = fixture.update(0, true, true, vertical);
     check(first && fixture.compose(0) == fixture.placeholder, name + ": no edit before temporal evidence");
     if (!first) return;
@@ -479,6 +481,154 @@ bool benchmarkHud(Gpu& gpu, uint32_t width, uint32_t height, bool staticLock, bo
     return !gpu.debugErrors();
 }
 
+void testHudLockHighResPartialTiles(Gpu& gpu) {
+    // Non-multiple-of-16 dimensions with height >= 1800 exercise both the 20x20 (+-2 px)
+    // groupshared compose halo, partial edge threadgroup clamping, and gAnyStill==0 tile early-out.
+    constexpr uint32_t W = 38, H = 1804;
+    constexpr DXGI_FORMAT F = DXGI_FORMAT_R8G8B8A8_UNORM;
+    auto* device = gpu.device.Get();
+    Plane real[2]{{pipeline::makeTexture(device, W, H, F, true), F, W, H, 4}, {pipeline::makeTexture(device, W, H, F, true), F, W, H, 4}};
+    Plane generated{pipeline::makeTexture(device, W, H, F, true), F, W, H, 4};
+    check(real[0].texture && real[1].texture && generated.texture, "hud lock 4k-edge: textures created");
+    pipeline::HudLock lock;
+    check(lock.initialize(device, W, H, F, 0), "hud lock 4k-edge: created");
+    pipeline::DescriptorStager stager;
+    check(stager.initialize(device, 64), "hud lock 4k-edge: staging heap");
+    ID3D12Resource* reals[2] = {real[0].texture.Get(), real[1].texture.Get()};
+    ID3D12Resource* gens[1] = {generated.texture.Get()};
+    lock.createViews(device, stager, reals, gens, 1);
+
+    auto interiorHud = [](uint32_t x, uint32_t y) { return x >= 4 && x < 20 && y >= 16 && y < 36; };
+    auto cornerHud = [](uint32_t x, uint32_t y) { return x >= 24 && x < 38 && y >= 1788 && y < 1804; };
+    auto picture = [&](int shift, bool hud) {
+        std::vector<uint8_t> px(size_t(W) * H * 4);
+        for (uint32_t y = 0; y < H; ++y)
+            for (uint32_t x = 0; x < W; ++x) {
+                uint8_t v;
+                if (hud && (interiorHud(x, y) || cornerHud(x, y))) v = ((x / 3) % 2) ? 230 : 25;
+                else {
+                    uint32_t h = uint32_t(int(x) + shift) * 374761393u + uint32_t(int(y) + shift / 3) * 668265263u;
+                    h = (h ^ (h >> 13)) * 1274126177u;
+                    v = uint8_t(40 + (h >> 25));
+                }
+                uint8_t* p = px.data() + (size_t(y) * W + x) * 4;
+                p[0] = p[1] = p[2] = v; p[3] = 255;
+            }
+        return px;
+    };
+    pipeline::StateTracker states;
+    std::vector<uint8_t> last;
+    bool ran = true;
+    int i = 0;
+    for (; i < 60; ++i) {
+        const unsigned parity = unsigned(i) & 1u;
+        gpu.begin();
+        last = picture(i * 5, true);
+        auto up = recordFill(gpu, real[parity], last, states.get(real[parity].texture.Get()), D3D12_RESOURCE_STATE_COMMON);
+        states.set(real[parity].texture.Get(), D3D12_RESOURCE_STATE_COMMON);
+        ran = ran && lock.update(gpu.list.Get(), states, parity, i == 0) && gpu.submitAndWait();
+    }
+    check(ran, "hud lock 4k-edge: 60 real frames updated");
+
+    gpu.begin();
+    auto up = recordFill(gpu, generated, std::vector<uint8_t>(size_t(W) * H * 4, 128), states.get(generated.texture.Get()), D3D12_RESOURCE_STATE_COMMON);
+    states.set(generated.texture.Get(), D3D12_RESOURCE_STATE_COMMON);
+    const bool composed = lock.compose(gpu.list.Get(), states, 0, unsigned(i - 1) & 1u);
+    auto rb = recordRead(gpu, generated, states.get(generated.texture.Get()));
+    const bool ok = composed && gpu.submitAndWait();
+    check(ok, "hud lock 4k-edge: composed");
+    if (!ok) return;
+    const auto out = mapRead(generated, rb.Get());
+
+    int hudHeld = 0, hudTotal = 0, edgeHeld = 0, edgeTotal = 0, bgKept = 0, bgTotal = 0;
+    for (uint32_t y = 0; y < H; ++y)
+        for (uint32_t x = 0; x < W; ++x) {
+            const size_t k = (size_t(y) * W + x) * 4;
+            if (interiorHud(x, y)) { ++hudTotal; hudHeld += out[k] == last[k]; }
+            else if (cornerHud(x, y)) { ++edgeTotal; edgeHeld += out[k] == last[k]; }
+            else if (y >= 100 && y < 1700) { ++bgTotal; bgKept += out[k] == 128; }
+        }
+    std::printf("INFO hud lock 4k-edge (%s): interior %d/%d, corner %d/%d, moving %d/%d\n",
+                lock.describe().c_str(), hudHeld, hudTotal, edgeHeld, edgeTotal, bgKept, bgTotal);
+    check(hudHeld >= hudTotal * 95 / 100, "hud lock 4k-edge: interior HUD held");
+    check(edgeHeld >= edgeTotal * 90 / 100, "hud lock 4k-edge: partial-edge corner HUD held");
+    check(bgKept == bgTotal, "hud lock 4k-edge: moving tiles keep generated pixels");
+    check(!gpu.debugErrors(), "hud lock 4k-edge: no D3D12 debug errors");
+}
+
+void testCombinedStaticAndDynamicHdr10Hud(Gpu& gpu) {
+    // Exercise lockStatic=true + dynamicProtection=true together on HDR10 R10G10B10A2_UNORM.
+    constexpr uint32_t W = 257, H = 145;
+    DynamicHudFixture fixture{gpu};
+    const bool initialized = fixture.initialize(W, H, DXGI_FORMAT_R10G10B10A2_UNORM, 2, true, true);
+    check(initialized, "combined HDR10 static+dynamic HUD: passes created");
+    if (!initialized) return;
+    std::printf("INFO combined HDR10 static+dynamic HUD: %s\n", fixture.lock.describe().c_str());
+
+    const uint32_t cell = std::clamp((H + 269u) / 270u, 2u, 8u);
+    const uint32_t start = H / 8;
+    auto staticAt = [](uint32_t x, uint32_t y) { return x >= 180 && x < 240 && y >= 100 && y < 130; };
+    auto buildFrame = [&](unsigned index, bool hud) {
+        auto px = fixture.picture(index, hud, false);
+        if (hud) {
+            for (uint32_t y = 100; y < 130; ++y)
+                for (uint32_t x = 180; x < 240; ++x) {
+                    const float v = ((x / 3) % 2) ? 0.92f : 0.08f;
+                    setPixel(px.data() + (size_t(y) * W + x) * 4, DXGI_FORMAT_R10G10B10A2_UNORM, v, v, v, 1.0f);
+                }
+        }
+        return px;
+    };
+    auto uploadAndRun = [&](unsigned index, bool hud, bool reset) {
+        const auto parity = index & 1u;
+        if (!gpu.begin()) return false;
+        fixture.uploaded[parity] = buildFrame(index, hud);
+        auto up = recordFill(gpu, fixture.real[parity], fixture.uploaded[parity],
+                             fixture.states.get(fixture.real[parity].texture.Get()), D3D12_RESOURCE_STATE_COMMON);
+        fixture.states.set(fixture.real[parity].texture.Get(), D3D12_RESOURCE_STATE_COMMON);
+        return up && fixture.lock.update(gpu.list.Get(), fixture.states, parity, reset) && gpu.submitAndWait();
+    };
+
+    bool ok = uploadAndRun(0, true, true);
+    check(ok && fixture.compose(0) == fixture.placeholder, "combined HDR10 HUD: no edit after reset");
+    for (unsigned i = 1; i < 64 && ok; ++i) ok = uploadAndRun(i, true, false);
+    check(ok, "combined HDR10 HUD: learned from 64 frames");
+    if (!ok) return;
+
+    const auto previous = fixture.compose(0, false);
+    const auto newer = fixture.compose(0, true);
+    check(previous.size() == fixture.placeholder.size() && newer.size() == previous.size(),
+          "combined HDR10 HUD: composed early and late phases");
+    size_t changedDyn = 0, matchDynPrev = 0, matchDynNewer = 0, staticHeld = 0, staticTotal = 0, spill = 0;
+    for (uint32_t y = 0; y < H; ++y)
+        for (uint32_t x = 0; x < W; ++x) {
+            const size_t at = (size_t(y) * W + x) * 4;
+            const auto eq = [at](const auto& a, const auto& b) { return std::memcmp(a.data() + at, b.data() + at, 4) == 0; };
+            if (y >= start + 2 * cell && y <= start + 4 * cell && x >= W / 4 && x < W / 3) {
+                if (!eq(fixture.uploaded[0], fixture.uploaded[1])) {
+                    ++changedDyn;
+                    matchDynPrev += eq(previous, fixture.uploaded[0]);
+                    matchDynNewer += eq(newer, fixture.uploaded[1]);
+                }
+            } else if (staticAt(x, y)) {
+                ++staticTotal;
+                staticHeld += eq(previous, fixture.uploaded[0]);
+            } else if (x < W / 9 || (y > start + 6 * cell + 4 && y < 86)) {
+                spill += !eq(previous, fixture.placeholder) || !eq(newer, fixture.placeholder);
+            }
+        }
+    std::printf("INFO combined HDR10 HUD: dyn %zu/%zu early %zu/%zu late, static %zu/%zu, spill=%zu\n",
+                matchDynPrev, changedDyn, matchDynNewer, changedDyn, staticHeld, staticTotal, spill);
+    check(changedDyn > 0 && matchDynPrev == changedDyn && matchDynNewer == changedDyn,
+          "combined HDR10 HUD: dynamic bar tracks early and late frames");
+    check(staticTotal > 0 && staticHeld >= staticTotal * 95 / 100,
+          "combined HDR10 HUD: static HUD held alongside dynamic mask");
+    check(spill == 0, "combined HDR10 HUD: moving scenery stays untouched");
+    check(uploadAndRun(64, false, false) && fixture.compose(1) == fixture.placeholder,
+          "combined HDR10 HUD: removal releases both static and dynamic locks");
+    check(!gpu.debugErrors(), "combined HDR10 HUD: no D3D12 debug errors");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -499,6 +649,8 @@ int main(int argc, char** argv) {
     testDynamicHud(gpu, DXGI_FORMAT_R8G8B8A8_UNORM, 0, false, "SDR");
     testDynamicHud(gpu, DXGI_FORMAT_R16G16B16A16_FLOAT, 1, true, "scRGB");
     testDynamicHud(gpu, DXGI_FORMAT_R10G10B10A2_UNORM, 2, false, "HDR10 PQ");
+    testHudLockHighResPartialTiles(gpu);
+    testCombinedStaticAndDynamicHdr10Hud(gpu);
     std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);
     return failures ? 1 : 0;
 }

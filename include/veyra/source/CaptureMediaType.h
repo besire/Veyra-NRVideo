@@ -177,18 +177,19 @@ inline bool copyCaptureSample(const CaptureMediaLayout& layout,const uint8_t* sr
     if(layout.planes>1&&(!dst.data[1]||dst.linesize[1]<int(layout.chromaRowBytes)))return false;
     if(layout.planes>2&&(!dst.data[2]||dst.linesize[2]<int(layout.chromaRowBytes)))return false;
     const bool flip=layout.bottomUp!=flipVertical;
-    // Fast path: no row reorder and no per-pixel conversion, so the whole
-    // plane is one contiguous copy (single-plane layouts only).
+    // Fast path: no row reorder and no per-pixel conversion, so contiguous planes copy in one memcpy each.
     const bool rowConvert=(layout.format==AV_PIX_FMT_BGR0&&(layout.packing==CapturePacking::Bgr24||layout.packing==CapturePacking::Rgb555||layout.packing==CapturePacking::Rgb565))||
         (layout.format==AV_PIX_FMT_YUYV422&&(layout.packing==CapturePacking::Uyvy||layout.packing==CapturePacking::Yvyu));
-    if(!flip&&!rowConvert&&layout.planes==1&&size_t(dst.linesize[0])==size_t(layout.stride)){
-        std::memcpy(dst.data[0],src,size_t(layout.stride)*layout.height);
-        return true;
+    bool plane0Done=false;
+    if(!flip&&!rowConvert&&size_t(dst.linesize[0])==size_t(layout.stride)&&layout.height>0){
+        std::memcpy(dst.data[0],src,size_t(layout.stride)*(layout.height-1)+layout.rowBytes);
+        if(layout.planes==1)return true;
+        plane0Done=true;
     }
     // When rows are flipped, read the source ascending and write the
     // destination descending: the read stream keeps the hardware prefetcher
     // (walking the source backwards cost ~2x on the 4K RGB24 case).
-    for(unsigned sourceRow=0;sourceRow<layout.height;++sourceRow){
+    if(!plane0Done)for(unsigned sourceRow=0;sourceRow<layout.height;++sourceRow){
         const unsigned dstRow=flip?layout.height-1-sourceRow:sourceRow;
         const auto* s=src+size_t(sourceRow)*layout.stride;auto* d=dst.data[0]+ptrdiff_t(dstRow)*dst.linesize[0];
         if(layout.format==AV_PIX_FMT_BGR0&&layout.packing==CapturePacking::Bgr24){for(unsigned x=0;x<layout.width;++x){d[x*4]=s[x*3];d[x*4+1]=s[x*3+1];d[x*4+2]=s[x*3+2];d[x*4+3]=255;}}
@@ -199,10 +200,18 @@ inline bool copyCaptureSample(const CaptureMediaLayout& layout,const uint8_t* sr
             const bool uy=layout.packing==CapturePacking::Uyvy;for(unsigned x=0;x<layout.rowBytes;x+=4){d[x]=s[x+(uy?1:0)];d[x+1]=s[x+(uy?0:3)];d[x+2]=s[x+(uy?3:2)];d[x+3]=s[x+(uy?2:1)];}
         }else std::memcpy(d,s,layout.rowBytes);
     }
-    for(unsigned p=1;p<layout.planes;++p)for(unsigned y=0;y<layout.height/2;++y){
-        const auto* s=src+(p==1?layout.chromaOffset:layout.secondChromaOffset)+size_t(flip?layout.height/2-1-y:y)*layout.chromaStride;auto* d=dst.data[p]+ptrdiff_t(y)*dst.linesize[p];
-        if(layout.packing==CapturePacking::Nv21){for(unsigned x=0;x<layout.chromaRowBytes;x+=2){d[x]=s[x+1];d[x+1]=s[x];}}
-        else std::memcpy(d,s,layout.chromaRowBytes);
+    for(unsigned p=1;p<layout.planes;++p){
+        const unsigned chromaH=layout.height/2;
+        const auto* planeSrc=src+(p==1?layout.chromaOffset:layout.secondChromaOffset);
+        if(!flip&&layout.packing!=CapturePacking::Nv21&&chromaH>0&&size_t(dst.linesize[p])==size_t(layout.chromaStride)){
+            std::memcpy(dst.data[p],planeSrc,size_t(layout.chromaStride)*(chromaH-1)+layout.chromaRowBytes);
+            continue;
+        }
+        for(unsigned y=0;y<chromaH;++y){
+            const auto* s=planeSrc+size_t(flip?chromaH-1-y:y)*layout.chromaStride;auto* d=dst.data[p]+ptrdiff_t(y)*dst.linesize[p];
+            if(layout.packing==CapturePacking::Nv21){for(unsigned x=0;x<layout.chromaRowBytes;x+=2){d[x]=s[x+1];d[x+1]=s[x];}}
+            else std::memcpy(d,s,layout.chromaRowBytes);
+        }
     }
     return true;
 }

@@ -88,6 +88,28 @@ int main(){
     check(source::captureMediaLayout(type,layout)&&layout.stride==6&&layout.sampleBytes==36,"NV12 plane pitch derived without RGB conversion");
     frame=av_frame_alloc();frame->format=AV_PIX_FMT_NV12;frame->width=4;frame->height=4;av_frame_get_buffer(frame,32);raw.assign(36,0xee);for(int y=0;y<6;++y)for(int x=0;x<4;++x)raw[y*6+x]=uint8_t(y*10+x);
     check(source::copyCaptureSample(layout,raw.data(),raw.size(),*frame)&&frame->data[1][0]==40&&frame->data[1][frame->linesize[1]]==50,"NV12 UV offset respects input stride");av_frame_free(&frame);
+    {
+        // Contiguous multi-plane fast path (P010 / NV12 when dst.linesize == layout.stride).
+        VIDEOINFOHEADER2 p010Vi{};p010Vi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);p010Vi.bmiHeader.biWidth=64;p010Vi.bmiHeader.biHeight=4;p010Vi.bmiHeader.biBitCount=24;
+        AM_MEDIA_TYPE p010Type=type;p010Type.subtype={source::captureFourcc('P','0','1','0'),0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}};p010Type.pbFormat=reinterpret_cast<BYTE*>(&p010Vi);
+        source::CaptureMediaLayout p010Layout;
+        check(source::captureMediaLayout(p010Type,p010Layout)&&p010Layout.planes==2&&p010Layout.stride==128&&p010Layout.chromaStride==128&&p010Layout.chromaOffset==512,"P010 64x4 contiguous layout");
+        std::vector<uint8_t> sample(p010Layout.sampleBytes);for(size_t i=0;i<sample.size();++i)sample[i]=uint8_t((i*13+7)&0xff);
+        AVFrame* fContig=av_frame_alloc();fContig->format=AV_PIX_FMT_P010;fContig->width=64;fContig->height=4;av_frame_get_buffer(fContig,128);
+        AVFrame* fPadded=av_frame_alloc();fPadded->format=AV_PIX_FMT_P010;fPadded->width=64;fPadded->height=4;
+        std::vector<uint8_t> padY(4*160,0xaa),padUv(2*160,0x55);
+        fPadded->data[0]=padY.data();fPadded->linesize[0]=160;fPadded->data[1]=padUv.data();fPadded->linesize[1]=160;
+        const bool okContig=source::copyCaptureSample(p010Layout,sample.data(),sample.size(),*fContig);
+        const bool okPadded=source::copyCaptureSample(p010Layout,sample.data(),sample.size(),*fPadded);
+        bool match=okContig&&okPadded&&fContig->linesize[0]==128&&fContig->linesize[1]==128;
+        for(int y=0;y<4&&match;++y)match&=std::memcmp(fContig->data[0]+y*fContig->linesize[0],fPadded->data[0]+y*fPadded->linesize[0],128)==0;
+        for(int y=0;y<2&&match;++y)match&=std::memcmp(fContig->data[1]+y*fContig->linesize[1],fPadded->data[1]+y*fPadded->linesize[1],128)==0;
+        check(match,"P010 contiguous whole-plane copy matches padded row-by-row copy");
+        AVFrame* fFlip=av_frame_alloc();fFlip->format=AV_PIX_FMT_P010;fFlip->width=64;fFlip->height=4;av_frame_get_buffer(fFlip,128);
+        const bool okFlip=source::copyCaptureSample(p010Layout,sample.data(),sample.size(),*fFlip,true);
+        check(okFlip&&std::memcmp(fFlip->data[0],sample.data()+3*128,128)==0&&std::memcmp(fFlip->data[1],sample.data()+p010Layout.chromaOffset+128,128)==0,"P010 flipVertical bypasses contiguous fast path and reverses rows");
+        av_frame_free(&fFlip);fPadded->data[0]=fPadded->data[1]=nullptr;av_frame_free(&fPadded);av_frame_free(&fContig);
+    }
     type.subtype=MEDIASUBTYPE_RGB32;vi.bmiHeader.biHeight=2;vi.bmiHeader.biSizeImage=32;check(source::captureMediaLayout(type,layout)&&layout.bottomUp&&layout.rowBytes==16,"RGB DIB keeps bottom-up compatibility");
     WAVEFORMATEX wave{};wave.wFormatTag=WAVE_FORMAT_PCM;wave.nChannels=2;wave.nSamplesPerSec=48000;wave.wBitsPerSample=16;wave.nBlockAlign=4;wave.nAvgBytesPerSec=192000;
     AM_MEDIA_TYPE audio{};audio.majortype=MEDIATYPE_Audio;audio.subtype=MEDIASUBTYPE_PCM;audio.formattype=FORMAT_WaveFormatEx;audio.cbFormat=sizeof(wave);audio.pbFormat=reinterpret_cast<BYTE*>(&wave);

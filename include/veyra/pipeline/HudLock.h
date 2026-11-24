@@ -55,7 +55,7 @@ private:
     uint32_t width_ = 0, height_ = 0;
     uint32_t cellSize_ = 0, maskWidth_ = 0, maskHeight_ = 0;
     unsigned outputMode_ = 0, generatedCount_ = 0;
-    bool staticLock_ = true;
+    bool staticLock_ = true, inPlace_ = false;
     DXGI_FORMAT format_ = DXGI_FORMAT_UNKNOWN;
     ComputePass update_, dynamic_, fill_, compose_;
     ComPtr<ID3D12Resource> state_, dynamicMask_, protectionMask_, scratch_;

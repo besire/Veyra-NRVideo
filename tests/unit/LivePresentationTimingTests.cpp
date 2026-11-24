@@ -699,6 +699,48 @@ int main(){
          PictureReference deep4k;const auto a=p010(deep4k,y16,uv16);auto y=y16;for(unsigned k=0;k<63;++k)y[size_t(k)*99991]=uint16_t(y[size_t(k)*99991]+(20<<6));
          const auto b=p010(deep4k,y,uv16);y[5]=uint16_t(y[5]+(20<<6));const auto c=p010(deep4k,y,uv16);
          check(b.repeat&&b.id==a.id&&b.over==63&&!c.repeat&&c.over==64,"4K P010: 63 words beyond the band repeat, 64 are new");}
+        {// P010 at 2560x1440 (28-word outlier tolerance) + AVX2 128B/32B/scalar boundary rows + copyReference fast path.
+         std::vector<uint16_t> y16(2560*1440),uv16(2560*720);for(size_t i=0;i<y16.size();++i)y16[i]=uint16_t((64+(i*31)%800)<<6);for(size_t i=0;i<uv16.size();++i)uv16[i]=uint16_t(512<<6);
+         auto p010qhd=[](PictureReference& r,const std::vector<uint16_t>& y,const std::vector<uint16_t>& uv){
+             PicturePlane planes[2]{{reinterpret_cast<const uint8_t*>(y.data()),5120,5120,1440},{reinterpret_cast<const uint8_t*>(uv.data()),5120,5120,720}};
+             return r.observe(planes,2,PictureComponents::Words,PictureReference::bandFor(10,6));};
+         check(PictureReference::toleranceFor(2560ull*1440*3/2)==28,"1440p P010 tolerance is 28 words");
+         PictureReference qhd;const auto a=p010qhd(qhd,y16,uv16);auto y=y16;
+         for(size_t i=0;i<y.size();i+=17)y[i]=uint16_t(y[i]+(12<<6));
+         for(unsigned k=0;k<28;++k)y[size_t(k)*131070+11]=uint16_t(y[size_t(k)*131070+11]+(16<<6));
+         const auto b=p010qhd(qhd,y,uv16);
+         check(b.repeat&&b.id==a.id&&b.over==28&&b.max8==4,"1440p P010: noise within band + 28 outliers repeat");
+         y[13]=uint16_t(y[13]+(16<<6));
+         const auto c=p010qhd(qhd,y,uv16);
+         check(!c.repeat&&c.id!=a.id&&c.over==29,"1440p P010: the 29th outlier makes a new picture");
+         std::vector<uint8_t> padY(16*32,0xee),padUv(8*32,0x77);
+         for(unsigned r=0;r<16;++r)for(unsigned col=0;col<20;++col)padY[size_t(r)*32+col]=uint8_t((r*23+col*5)&0xff);
+         for(unsigned r=0;r<8;++r)for(unsigned col=0;col<20;++col)padUv[size_t(r)*32+col]=uint8_t((r*19+col*7+3)&0xff);
+         PicturePlane padPlanes[2]{{padY.data(),32,20,16},{padUv.data(),32,20,8}};
+         std::vector<uint8_t> tightY(16*20),tightUv(8*20);
+         for(unsigned r=0;r<16;++r)std::memcpy(tightY.data()+size_t(r)*20,padY.data()+size_t(r)*32,20);
+         for(unsigned r=0;r<8;++r)std::memcpy(tightUv.data()+size_t(r)*20,padUv.data()+size_t(r)*32,20);
+         PicturePlane tightPlanes[2]{{tightY.data(),20,20,16},{tightUv.data(),20,20,8}};
+         PictureReference refTight,refPad;
+         const auto t0=refTight.observe(tightPlanes,2,PictureComponents::Bytes);
+         const auto p0=refPad.observe(padPlanes,2,PictureComponents::Bytes);
+         check(refTight.observe(padPlanes,2,PictureComponents::Bytes).repeat&&refPad.observe(tightPlanes,2,PictureComponents::Bytes).repeat&&t0.id==p0.id,"PictureReference contiguous copy matches padded-pitch copy");
+         for(const size_t rowBytes:{size_t(130),size_t(162),size_t(254)}){
+             std::vector<uint8_t> ba(rowBytes+3,80);
+             PicturePlane pa{ba.data()+1,rowBytes,rowBytes,1};
+             PictureReference rb;rb.observe(&pa,1,PictureComponents::Bytes);
+             auto bb=ba;bb[1+2]=85;bb[1+rowBytes-3]=86;bb[1+rowBytes-1]=87;
+             PicturePlane pb{bb.data()+1,rowBytes,rowBytes,1};
+             const auto rbOut=rb.observe(&pb,1,PictureComponents::Bytes);
+             check(!rbOut.repeat&&rbOut.over==3&&rbOut.max8==7,"AVX2 byte boundary: 128B/32B/scalar tails counted accurately");
+             std::vector<uint16_t> wa(rowBytes/2+2,64<<6);
+             PicturePlane pwa{reinterpret_cast<const uint8_t*>(wa.data())+2,rowBytes,rowBytes,1};
+             PictureReference rw;rw.observe(&pwa,1,PictureComponents::Words,PictureReference::bandFor(10,6));
+             auto wb=wa;wb[1+2]+=16<<6;wb[1+rowBytes/2-2]+=20<<6;wb[1+rowBytes/2-1]+=24<<6;
+             PicturePlane pwb{reinterpret_cast<const uint8_t*>(wb.data())+2,rowBytes,rowBytes,1};
+             const auto rwOut=rw.observe(&pwb,1,PictureComponents::Words,PictureReference::bandFor(10,6));
+             check(!rwOut.repeat&&rwOut.over==3&&rwOut.max8==6,"AVX2 word boundary: 128B/32B/scalar tails counted accurately");
+         }}
     }
     {
         // ContentDedup on picture numbers: synthetic pictures sampled at a capture rate.

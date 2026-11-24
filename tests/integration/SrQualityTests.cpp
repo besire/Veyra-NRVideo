@@ -238,13 +238,25 @@ std::vector<double> linear(const sink::RgbaImage& img){
     for(size_t p=0;p<size_t(img.width)*img.height;++p)for(unsigned c=0;c<3;++c)out[p*3+c]=half(img,p*4+c);
     return out;
 }
-// HdrVideoSrRestore's bilinear base sample for output pixel (x,y) of a W x H output.
-double bilinear(const std::vector<double>& img,unsigned w,unsigned h,unsigned W,unsigned H,unsigned x,unsigned y,unsigned c){
-    const double px=(x+0.5)*double(w)/W-0.5,py=(y+0.5)*double(h)/H-0.5;const int qx=int(std::floor(px)),qy=int(std::floor(py));
-    const double fx=px-qx,fy=py-qy;double v=0;
-    for(int j=0;j<2;++j)for(int i=0;i<2;++i){const int sx=std::clamp(qx+i,0,int(w)-1),sy=std::clamp(qy+j,0,int(h)-1);
-        v+=img[(size_t(sy)*w+sx)*3+c]*(i?fx:1-fx)*(j?fy:1-fy);}
-    return v;
+// HdrVideoSrRestore's bounded Catmull-Rom base sample for output pixel (x,y) of a W x H output.
+double cubicBounded(const std::vector<double>& img,unsigned w,unsigned h,unsigned W,unsigned H,unsigned x,unsigned y,unsigned c){
+    if(w==W&&h==H)return img[(size_t(y)*w+x)*3+c];
+    const double px=(x+0.5)*double(w)/W-0.5,py=(y+0.5)*double(h)/H-0.5;
+    const int qx=int(std::floor(px)),qy=int(std::floor(py));
+    const double tx=px-qx,ty=py-qy;
+    const auto weights=[](double t){
+        const double t2=t*t,t3=t2*t;
+        return std::array<double,4>{-0.5*t+t2-0.5*t3,1.0-2.5*t2+1.5*t3,0.5*t+2.0*t2-1.5*t3,-0.5*t2+0.5*t3};
+    };
+    const auto wx=weights(tx),wy=weights(ty);
+    double v=0,lo=1e30,hi=-1e30;
+    for(int j=0;j<4;++j)for(int i=0;i<4;++i){
+        const int sx=std::clamp(qx+i-1,0,int(w)-1),sy=std::clamp(qy+j-1,0,int(h)-1);
+        const double s=img[(size_t(sy)*w+sx)*3+c];
+        v+=s*wx[i]*wy[j];
+        if(i>=1&&i<=2&&j>=1&&j<=2){lo=std::min(lo,s);hi=std::max(hi,s);}
+    }
+    return std::clamp(v,lo,hi);
 }
 // SDR input/output transparency (the A/B baseline) and both HDR restores of
 // double SR. HdrRestore returns its base plus a delta clamped to +-0.5*203/80,
@@ -275,8 +287,8 @@ int restore(const std::filesystem::path& directory){
         for(unsigned y=0;y<2160;++y)for(unsigned x=0;x<3840;++x)for(unsigned c=0;c<3;++c){
             const size_t i=(size_t(y)*3840+x)*4+c;const double f=half(two.firstLinear,i),o=half(two.output,i);
             if(!std::isfinite(f)||!std::isfinite(o)){++bad;continue;}
-            first=std::max(first,std::abs(f-bilinear(base,2560,1440,3840,2160,x,y,c)));
-            second=std::max(second,std::abs(o-bilinear(reduced,1920,1080,3840,2160,x,y,c)));
+            first=std::max(first,std::abs(f-cubicBounded(base,2560,1440,3840,2160,x,y,c)));
+            second=std::max(second,std::abs(o-cubicBounded(reduced,1920,1080,3840,2160,x,y,c)));
         }
         check(!bad&&first<=bound,"HDR first restore uses the source base ("+std::to_string(first)+")");
         check(!bad&&second<=bound,"HDR second restore uses the reduced first result ("+std::to_string(second)+")");

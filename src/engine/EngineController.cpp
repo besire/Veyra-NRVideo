@@ -1725,6 +1725,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 std::lock_guard lock(mutex_);snapshot_.metrics.flow=flow;
             };
             const bool checkpointPresentation=GetEnvironmentVariableW(L"VEYRA_TEST_NO_PROCESS_PRESENT",nullptr,0)==0;
+            const bool hdrCheckpointPresentation=GetEnvironmentVariableW(L"VEYRA_TEST_NO_HDR_PROCESS_PRESENT",nullptr,0)==0;
             const bool capturePresentAfterReady=GetEnvironmentVariableW(L"VEYRA_TEST_CAPTURE_PRESENT_AFTER_READY",nullptr,0)>0;
             bool processingGraph=false;
             auto waitLive=[&]{
@@ -1745,8 +1746,9 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
             // result swung between runs (DLSS 2X 1% low 113-118). The single owner thread
             // cannot do both; a frame due here goes out at the next checkpoint.
             auto presentDuringProcess=[&]{
-                if(!checkpointPresentation||!isCapture||!options.fg||graph->hdrOutput()||!presenter->independentQueue()||
-                   !liveScheduler||stop_||(paused_&&!seekPreviewPending)||seekSeconds_>=0)return;
+                if(!checkpointPresentation||!isCapture||!options.fg||
+                   (graph->hdrOutput()&&(!hdrCheckpointPresentation||graph->doviP7Active()))||
+                   !presenter->independentQueue()||!liveScheduler||stop_||(paused_&&!seekPreviewPending)||seekSeconds_>=0)return;
                 const auto due=liveScheduler->wakeAt(),now=host100ns();
                 if(due>0&&due<=now)liveScheduler->advance(now);
             };

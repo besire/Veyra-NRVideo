@@ -14,24 +14,41 @@ cbuffer Constants : register(b0) {
 // A roughly perceptual value: sRGB and PQ are already encoded; scRGB is linear (1 = 80 nits).
 float3 perceptual(float3 v) { return outputMode == 1 ? sqrt(max(v, 0) / 2.5) : v; }
 float luma(float3 v) { return dot(v, float3(0.2126, 0.7152, 0.0722)); }
-float3 at(int2 p) { return perceptual(currentTex[clamp(p, int2(0, 0), int2(width - 1, height - 1))].rgb); }
+float3 at(int2 p) { return perceptual(currentTex[clamp(p, int2(0, 0), int2(int(width) - 1, int(height) - 1))].rgb); }
 
 // 1/0.06: about 38 frames (1.3 s at 30 FPS) to reach 0.9 from zero.
 static const float kRise = 0.06;
 static const float kStill = 0.02;   // largest channel change still counted as the same pixel
 static const float kFade = 0.97;    // held contrast fades about 3 % per frame
 
+groupshared float sLuma[18][18];
+
 [numthreads(16, 16, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= width || id.y >= height) return;
-    if (reset != 0) { stateTex[id.xy] = float2(0, 0); return; }
+void main(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint gidx : SV_GroupIndex) {
+    if (reset != 0) {
+        if (id.x < width && id.y < height) stateTex[id.xy] = float2(0, 0);
+        return;
+    }
     const int2 p = int2(id.xy);
     const float3 c = at(p);
+    const float l = luma(c);
+    sLuma[tid.y + 1][tid.x + 1] = l;
+    if (gidx < 64) {
+        const int2 base = int2(gid.xy * 16u);
+        const uint side = gidx >> 4;
+        const int k = int(gidx & 15u);
+        if (side == 0) sLuma[0][k + 1] = luma(at(base + int2(k, -1)));
+        else if (side == 1) sLuma[17][k + 1] = luma(at(base + int2(k, 16)));
+        else if (side == 2) sLuma[k + 1][0] = luma(at(base + int2(-1, k)));
+        else sLuma[k + 1][17] = luma(at(base + int2(16, k)));
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (id.x >= width || id.y >= height) return;
     const float3 d = abs(c - perceptual(previousTex[id.xy].rgb));
     const float change = max(d.r, max(d.g, d.b));
-    const float l = luma(c);
-    const float contrast = max(max(abs(l - luma(at(p + int2(1, 0)))), abs(l - luma(at(p - int2(1, 0))))),
-                               max(abs(l - luma(at(p + int2(0, 1)))), abs(l - luma(at(p - int2(0, 1))))));
+    const uint sx = tid.x + 1, sy = tid.y + 1;
+    const float contrast = max(max(abs(l - sLuma[sy][sx + 1]), abs(l - sLuma[sy][sx - 1])),
+                               max(abs(l - sLuma[sy + 1][sx]), abs(l - sLuma[sy - 1][sx])));
     float2 s = stateTex[id.xy];
     s.x = change < kStill ? s.x + (1 - s.x) * kRise : 0;
     s.y = change < kStill ? max(contrast, s.y * kFade) : contrast;
